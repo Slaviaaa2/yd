@@ -5,6 +5,7 @@ namespace YtdlpCLI;
 internal static class Program
 {
     private const int BarWidth = 30;
+    private static readonly string[] SupportedAudioFormats = ["aac", "alac", "flac", "m4a", "mp3", "opus", "vorbis", "wav"];
 
     private static async Task<int> Main()
     {
@@ -29,8 +30,22 @@ internal static class Program
             Directory.CreateDirectory(folder);
         }
 
-        var baseDir    = Directory.GetCurrentDirectory();
-        var ytdlpPath  = Path.Combine(baseDir, "tools", "yt-dlp.exe");
+        Console.Write("Audio only? [y/N]: ");
+        var audioOnly = IsYes(Console.ReadLine());
+        var audioFormat = audioOnly ? ReadAudioFormat() : null;
+
+        var baseDir = AppContext.BaseDirectory;
+        string ytdlpPath;
+        try
+        {
+            ytdlpPath = await ToolDownloader.EnsureYtdlpAsync(baseDir);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"yt-dlp の準備に失敗しました: {ex.Message}");
+            return 2;
+        }
+
         var ffmpegPath = Path.Combine(baseDir, "tools", "ffmpeg.exe");
 
         var ytdlp = new Ytdlp(ytdlpPath, new ConsoleLogger());
@@ -83,13 +98,23 @@ internal static class Program
 
         try
         {
-            await ytdlp
-                .SetFormat("bestvideo+bestaudio/best")
+            ytdlp
+                .SetFormat(audioOnly ? "bestaudio/best" : "bestvideo+bestaudio/best")
                 .SetOutputFolder(folder)
                 .SetOutputTemplate("%(upload_date)s_%(id)s [%(resolution)s].%(ext)s")
                 .EmbedMetadata()
-                .EmbedThumbnail()
-                .SetFfmpegLocation(ffmpegPath)
+                .SetFFmpegLocation(ffmpegPath);
+
+            if (audioOnly)
+            {
+                ytdlp.ExtractAudio(audioFormat!);
+            }
+            else
+            {
+                ytdlp.EmbedThumbnail();
+            }
+
+            await ytdlp
                 .ExecuteAsync(url);
 
             return 0;
@@ -99,6 +124,35 @@ internal static class Program
             Console.WriteLine();
             Console.WriteLine("Error: " + ex.Message);
             return 2;
+        }
+    }
+
+    private static bool IsYes(string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+            return false;
+
+        return input.Trim().Equals("y", StringComparison.OrdinalIgnoreCase)
+            || input.Trim().Equals("yes", StringComparison.OrdinalIgnoreCase)
+            || input.Trim().Equals("1", StringComparison.OrdinalIgnoreCase)
+            || input.Trim().Equals("true", StringComparison.OrdinalIgnoreCase)
+            || input.Trim() == "はい";
+    }
+
+    private static string ReadAudioFormat()
+    {
+        while (true)
+        {
+            Console.Write("Audio extension [wav]: ");
+            var input = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(input))
+                return "wav";
+
+            var format = input.TrimStart('.').ToLowerInvariant();
+            if (SupportedAudioFormats.Contains(format, StringComparer.OrdinalIgnoreCase))
+                return format;
+
+            Console.WriteLine("Unsupported audio extension. Use: " + string.Join(", ", SupportedAudioFormats));
         }
     }
 }
