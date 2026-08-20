@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 
 namespace YtdlpCLI;
@@ -13,6 +15,12 @@ internal static class ToolProvisioner
     private const string DenoBaseUrl = "https://github.com/denoland/deno/releases/latest/download/";
 
     private const string BundleDirectoryName = "yt-dlp-bundle";
+
+    /// <summary>
+    /// PATH 上の yt-dlp を使ってよい古さの上限。ディストリのパッケージは数年前で止まっていることが多く、
+    /// 古い yt-dlp は YouTube 側の仕様変更で動かなくなるため、期限切れなら自前で新しいものを取得する。
+    /// </summary>
+    private static readonly TimeSpan MaxYtdlpAge = TimeSpan.FromDays(90);
 
     /// <summary>アーカイブを 1 つ落として、必要な実行ファイルだけ取り出すための指定。</summary>
     private sealed record RemoteArchive(string Url, ArchiveKind Kind, string[] Files);
@@ -43,8 +51,21 @@ internal static class ToolProvisioner
 
         if (Platform.FindOnPath("yt-dlp") is { } onPath)
         {
-            Console.WriteLine($"yt-dlp: システムにインストール済みのものを使用します ({onPath})");
-            return onPath;
+            var version = await TryReadYtdlpVersionAsync(onPath, ct);
+            if (version is null)
+            {
+                Console.WriteLine($"yt-dlp: {onPath} はバージョンを確認できないため使用しません。");
+            }
+            else if (DateTime.UtcNow - version.Value.Released > MaxYtdlpAge)
+            {
+                Console.WriteLine(
+                    $"yt-dlp: {onPath} は {version.Value.Text} と古いため使用しません（新しい版を取得します）。");
+            }
+            else
+            {
+                Console.WriteLine($"yt-dlp: システムにインストール済みのものを使用します ({onPath}, {version.Value.Text})");
+                return onPath;
+            }
         }
 
         Console.WriteLine($"yt-dlp が見つかりません。{asset.AssetName} をダウンロードします ({Platform.Describe()})...");
@@ -169,6 +190,61 @@ internal static class ToolProvisioner
 
         Console.WriteLine("deno の準備が完了しました。");
         return toolsDirectory;
+    }
+
+    /// <summary>
+    /// <c>yt-dlp --version</c> を実行して版を読む。yt-dlp の版は <c>YYYY.MM.DD</c> 形式なので
+    /// そのままリリース日として扱える。読めなければ <c>null</c>。
+    /// </summary>
+    private static async Task<(string Text, DateTime Released)?> TryReadYtdlpVersionAsync(string path, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(15));
+
+        string output;
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo(path, "--version")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+
+            if (process is null)
+                return null;
+
+            output = await process.StandardOutput.ReadToEndAsync(timeout.Token);
+            await process.WaitForExitAsync(timeout.Token);
+
+            if (process.ExitCode != 0)
+                return null;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return null; // 応答しないバイナリ
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+
+        var text = output.Trim();
+
+        // 開発版は 2026.08.19.123456 のように続きが付くので先頭 3 要素だけ見る
+        var parts = text.Split('.');
+        if (parts.Length < 3)
+            return null;
+
+        return DateTime.TryParseExact(
+            string.Join('.', parts[..3]),
+            "yyyy.MM.dd",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out var released)
+            ? (text, released)
+            : null;
     }
 
     private static async Task DownloadBinaryAsync(string url, string destinationPath, string label, CancellationToken ct)
