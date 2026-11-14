@@ -1,9 +1,9 @@
 # yd — fast yt-dlp front-end
 
-URL を貼るだけで最短でダウンロードできる CLI / インライン TUI。旧 C# 版 (master ブランチ) を Rust で全面書き直し中 (branch `rust-rewrite`)。
+URL を貼るだけで最短でダウンロードできる CLI / 対話 TUI（代替スクリーン）。旧 C# 版 (master ブランチ) を Rust で全面書き直し中 (branch `rust-rewrite`)。
 
 ## 技術と構成
-- Rust 2024 / clap / ratatui (Viewport::Inline + insert_before) + crossterm / serde + toml / ureq
+- Rust 2024 / clap / ratatui (REPL は代替スクリーン + Viewport::Fullscreen、`-p` のピッカーだけ短命の Viewport::Inline) + crossterm / serde + toml / ureq
 - yt-dlp はライブラリを使わずプロセス直呼び。進捗は `--progress-template` の JSON を行単位でパース
 - `src/tools/` 外部ツール (yt-dlp / ffmpeg / deno) の検出と自動取得。公開 IF は固定
 - `src/config.rs` 設定 `~/.config/yd/config.toml`（favorites, recent(10件), last format/dest, template）
@@ -16,16 +16,17 @@ URL を貼るだけで最短でダウンロードできる CLI / インライン
 - `cargo run -- <URL>` / `cargo run` (REPL)
 
 ## 決定事項
-- コマンド名 `yd`。引数なし = インライン REPL、`yd URL` = 前回の形式・保存先で即 DL
+- コマンド名 `yd`。引数なし = REPL（代替スクリーン。transcript ペイン + ライブ領域 + composer。終了時に元の画面へ戻り、保存したファイルの要約だけ通常画面に出す）、`yd URL` = 前回の形式・保存先で即 DL
 - 既定ファイル名 `Uploader - Title.ext`（`%(playlist_title|.)s/%(uploader,channel|Unknown)s - %(title)s.%(ext)s`。`&{}/` 形式は `/` が `⧸` に化けるので不可）。プレイリストは `<playlist名>/` 配下。`v=` と `list=` 両方ある URL は既定で単体（`--playlist` で全体）
 - 既存ファイルは削除しない。yt-dlp の既定どおりスキップ、`--force` で上書き
 - 見た目は Codex CLI 基調: 角丸枠のヘッダ、`›` プロンプト、`•` 見出し + `└` 詳細、dim グレー中心、アクセントは cyan、成功 ✔ green / 失敗 ✘ red。絵文字は使わない
 - UI テキストは日本語ではなく英語（短く）。README は日本語
 - 外部ツールは tools dir (`~/.local/share/yd/tools`) → PATH → 自動 DL。PATH の yt-dlp は 90 日より古ければ使わない
 - 保存先は `f:N`（N 番目のお気に入り）/ `r:N`（N 番目の最近）で参照でき、`config::resolve_dest` に一本化（0 始まり、一覧の表示順）。お気に入り名に `:` は不可。REPL は `URL /f x /o y /force` の行内修飾子でその行の DL だけ上書きでき、last_* は変えず recent にだけ記録
+- ワンショット出力とピッカー（`-p`）は通常画面のインライン表示のまま。REPL の transcript は PgUp/PgDn・Shift+↑↓ でスクロール、End で末尾追従に戻る
 
 ## やらないこと
-- フルスクリーン TUI、GUI、Ytdlp.NET 等ラッパーライブラリ
+- マウスキャプチャ（テキスト選択を残す）、GUI、Ytdlp.NET 等ラッパーライブラリ
 
 ## テスト時の注意
 - 設定は `YD_CONFIG_DIR`、ツールは `YD_TOOLS_DIR` で一時ディレクトリへ逃がす（実ユーザーの設定を汚さない）

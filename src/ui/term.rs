@@ -1,27 +1,32 @@
-//! Inline terminal (ratatui `Viewport::Inline`): finished output goes to normal scrollback via
-//! `insert_before`; only the live area at the bottom is redrawn. The viewport height follows
-//! the content, so a height change re-anchors the viewport at its current top row.
+//! Terminal setups. `FullTerm` is the REPL's alternate-screen terminal; `InlineTerm` is a
+//! short-lived inline viewport (ratatui `Viewport::Inline`) used by the one-shot pickers. Its
+//! height follows the content, so a height change re-anchors the viewport at its top row.
 
 use std::io::{self, IsTerminal, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
 use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Position;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::widgets::Paragraph;
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use super::ansi;
 
-/// Lines per `insert_before` call (keeps buffers small for huge outputs).
-const PRINT_CHUNK: usize = 200;
+static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 
 /// Undo raw mode / bracketed paste / hidden cursor. Safe to call repeatedly and from a panic hook.
 pub fn restore_terminal() {
+    if ALT_SCREEN.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
     let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
     let _ = disable_raw_mode();
 }
@@ -110,24 +115,6 @@ impl InlineTerm {
         Ok(())
     }
 
-    /// Append lines to the scrollback above the live area (wrapped to the terminal width).
-    pub fn print(&mut self, lines: &[String]) -> io::Result<()> {
-        if lines.is_empty() {
-            return Ok(());
-        }
-        self.term.autoresize()?;
-        let width = self.term.get_frame().area().width as usize;
-        let wrapped: Vec<Line> = lines.iter().flat_map(|s| ansi::wrap(ansi::to_line(s), width)).collect();
-        for chunk in wrapped.chunks(PRINT_CHUNK) {
-            let n = chunk.len() as u16;
-            let chunk = chunk.to_vec();
-            self.term.insert_before(n, |buf| {
-                Paragraph::new(chunk).render(buf.area, buf);
-            })?;
-        }
-        Ok(())
-    }
-
     /// Erase the live area and leave the cursor at its top-left (the next shell prompt goes there).
     pub fn finish(&mut self) {
         let _ = self.term.autoresize();
@@ -139,6 +126,43 @@ impl InlineTerm {
 }
 
 impl Drop for InlineTerm {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// Full-screen terminal on the alternate screen (the REPL). Restored on drop and from the panic hook.
+pub struct FullTerm {
+    term: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl FullTerm {
+    pub fn new() -> Result<Self> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            bail!("this needs an interactive terminal");
+        }
+        install_panic_hook();
+        enable_raw_mode()?;
+        let setup = || -> io::Result<Self> {
+            execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+            ALT_SCREEN.store(true, Ordering::SeqCst);
+            Ok(FullTerm {
+                term: Terminal::new(CrosstermBackend::new(io::stdout()))?,
+            })
+        };
+        setup().map_err(|e| {
+            restore_terminal();
+            e.into()
+        })
+    }
+
+    pub fn draw(&mut self, f: impl FnOnce(&mut Frame)) -> io::Result<()> {
+        self.term.draw(f)?;
+        Ok(())
+    }
+}
+
+impl Drop for FullTerm {
     fn drop(&mut self) {
         restore_terminal();
     }

@@ -1,5 +1,5 @@
-//! Interactive inline mode (`yd` without URLs): composer, download queue, slash commands, pickers.
-//! Finished output scrolls into the normal terminal scrollback; only the live area is redrawn.
+//! Interactive mode (`yd` without URLs) on the alternate screen: transcript pane, live area
+//! (progress, popup, pickers), composer. A short session summary is printed after leaving it.
 
 mod command;
 mod view;
@@ -13,6 +13,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::Config;
@@ -20,8 +23,8 @@ use crate::format::{DEFAULT_TEMPLATE, FormatSpec};
 use crate::tools::{self, ToolEvent, ToolOptions, Tools};
 use crate::ui::input::{History, LineEditor};
 use crate::ui::picker::{DestPicker, FormatPicker, Interactive, Step};
-use crate::ui::term::InlineTerm;
-use crate::ui::{self, detail, dim, error_line, heading, ok_line, oneshot, truncate, warn_line};
+use crate::ui::term::FullTerm;
+use crate::ui::{self, ansi, detail, dim, error_line, heading, ok_line, oneshot, truncate, warn_line};
 use crate::ytdlp::{self, Event, Job, Outcome};
 use command::{FavArgs, Parsed};
 
@@ -30,12 +33,13 @@ pub fn run(config: Config, tool_opts: ToolOptions) -> Result<u8> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("interactive mode needs a terminal (pass a URL to download without one)");
     }
-    let mut term = InlineTerm::new(3)?;
+    let mut term = FullTerm::new()?;
     let mut app = App::new(config, tool_opts);
-    app.print_card(term.width());
+    app.print_card();
     let result = app.event_loop(&mut term);
-    app.shutdown(&mut term);
-    term.finish();
+    app.shutdown();
+    drop(term); // leave the alternate screen before printing the summary
+    app.print_summary();
     result.map(|()| 0)
 }
 
@@ -90,6 +94,7 @@ fn run_job(q: &QueuedJob, tools: &Tools, cancel: &AtomicBool, tx: &Sender<Msg>) 
 // ---------------------------------------------------------------------------------------------
 
 struct Running {
+    url: String,
     title: String,
     percent: Option<f64>,
     speed: Option<f64>,
@@ -157,6 +162,70 @@ impl Modal {
     }
 }
 
+const TRANSCRIPT_MAX: usize = 3000;
+
+/// Everything that used to go to scrollback: kept in memory, drawn with wrapping, bottom-anchored.
+#[derive(Default)]
+struct Transcript {
+    lines: Vec<String>,
+    ver: u64,
+    /// Wrapped lines above the bottom (0 = follow output).
+    off: usize,
+    /// Output arrived while scrolled up.
+    unseen: bool,
+    page: usize,
+    cache: Option<(usize, u64, Vec<Line<'static>>)>,
+    last_total: usize,
+    last_w: usize,
+}
+
+impl Transcript {
+    fn push(&mut self, s: String) {
+        self.lines.push(s);
+        self.ver += 1;
+        if self.lines.len() > TRANSCRIPT_MAX + 500 {
+            self.lines.drain(..self.lines.len() - TRANSCRIPT_MAX);
+        }
+    }
+
+    fn extend(&mut self, it: impl IntoIterator<Item = String>) {
+        for l in it {
+            self.push(l);
+        }
+    }
+
+    /// The visible slice for a pane of `h` rows (updates the scroll bookkeeping).
+    fn visible(&mut self, w: usize, h: usize) -> Vec<Line<'static>> {
+        if self.cache.as_ref().is_none_or(|(cw, cv, _)| *cw != w || *cv != self.ver) {
+            let wrapped = self.lines.iter().flat_map(|l| ansi::wrap(ansi::to_line(l), w)).collect();
+            self.cache = Some((w, self.ver, wrapped));
+        }
+        let all = &self.cache.as_ref().unwrap().2;
+        let total = all.len();
+        if self.off > 0 && self.last_w == w && total > self.last_total {
+            self.off += total - self.last_total;
+            self.unseen = true;
+        }
+        self.last_total = total;
+        self.last_w = w;
+        self.page = h.saturating_sub(2).max(1);
+        self.off = self.off.min(total.saturating_sub(h));
+        if self.off == 0 {
+            self.unseen = false;
+        }
+        let end = total - self.off;
+        all[end.saturating_sub(h)..end].to_vec()
+    }
+
+    fn up(&mut self, n: usize) {
+        self.off = self.off.saturating_add(n);
+    }
+
+    fn down(&mut self, n: usize) {
+        self.off = self.off.saturating_sub(n);
+    }
+}
+
 struct App {
     cfg: Config,
     spec: FormatSpec,
@@ -176,7 +245,11 @@ struct App {
     rx: Receiver<Msg>,
     cancel: Arc<AtomicBool>,
     /// Lines waiting to be pushed into the scrollback.
-    scroll: Vec<String>,
+    scroll: Transcript,
+    /// Session summary data.
+    saved: Vec<PathBuf>,
+    skipped: usize,
+    failed: Vec<String>,
     quit: bool,
     started: Instant,
 }
@@ -210,7 +283,10 @@ impl App {
             job_tx,
             rx,
             cancel,
-            scroll: Vec::new(),
+            scroll: Transcript::default(),
+            saved: Vec::new(),
+            skipped: 0,
+            failed: Vec::new(),
             quit: false,
             started: Instant::now(),
         }
@@ -224,7 +300,8 @@ impl App {
         self.cfg.favorites.iter().find(|f| f.path == dir).map(|f| f.name.as_str())
     }
 
-    fn print_card(&mut self, width: usize) {
+    fn print_card(&mut self) {
+        let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
         let lines = view::card(width, &self.spec, &self.dest, self.fav_name_for(&self.dest));
         self.scroll.extend(lines);
     }
@@ -237,15 +314,13 @@ impl App {
 
     // ----- main loop ---------------------------------------------------------------------
 
-    fn event_loop(&mut self, term: &mut InlineTerm) -> Result<()> {
+    fn event_loop(&mut self, term: &mut FullTerm) -> Result<()> {
         while !self.quit {
+            let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
             while let Ok(msg) = self.rx.try_recv() {
-                self.on_msg(msg, term.width());
+                self.on_msg(msg, width);
             }
-            let lines = std::mem::take(&mut self.scroll);
-            term.print(&lines)?;
-            let (live, cursor) = self.view(term.width());
-            term.render(&live, cursor)?;
+            term.draw(|f| self.draw(f))?;
 
             let animating = self.current.is_some() || self.tool.is_some();
             let timeout = Duration::from_millis(if animating { 60 } else { 200 });
@@ -266,7 +341,7 @@ impl App {
     }
 
     /// Stop a running download (so no yt-dlp is left behind) before the terminal is restored.
-    fn shutdown(&mut self, term: &mut InlineTerm) {
+    fn shutdown(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
         self.queue.clear();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -281,8 +356,6 @@ impl App {
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
-        let lines = std::mem::take(&mut self.scroll);
-        let _ = term.print(&lines);
     }
 
     // ----- worker messages ---------------------------------------------------------------
@@ -361,13 +434,18 @@ impl App {
                 run.percent = None;
                 run.stage = None;
                 self.scroll.extend(lines);
+                self.saved.push(path);
             }
             Event::AlreadyDownloaded { path } => {
                 run.percent = None;
+                self.skipped += 1;
                 self.scroll.extend(oneshot::already_lines(&path));
             }
             Event::Warning(m) => self.scroll.push(warn_line(&truncate(&m, width.saturating_sub(2)))),
-            Event::Error(m) => self.scroll.push(error_line(&m)),
+            Event::Error(m) => {
+                self.failed.push(format!("{} \u{b7} {}", truncate(&run.url, 40), truncate(&m, 80)));
+                self.scroll.push(error_line(&m));
+            }
         }
     }
 
@@ -386,7 +464,11 @@ impl App {
                     self.save_cfg();
                 }
             }
-            Err(e) if !cancelled => self.push(error_line(&e)),
+            Err(e) if !cancelled => {
+                let url = run.as_ref().map(|r| truncate(&r.url, 40)).unwrap_or_default();
+                self.failed.push(format!("{url} \u{b7} {}", truncate(&e, 80)));
+                self.push(error_line(&e));
+            }
             Err(_) => {}
         }
         if !cancelled {
@@ -433,6 +515,7 @@ impl App {
         }
         let Some(q) = self.queue.pop_front() else { return };
         self.current = Some(Running {
+            url: q.job.url.clone(),
             title: q.job.url.clone(),
             percent: None,
             speed: None,
@@ -505,7 +588,13 @@ impl App {
         if k.code != KeyCode::Esc {
             self.popup_dismissed = false;
         }
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
+            KeyCode::PageUp => self.scroll.up(self.scroll.page),
+            KeyCode::PageDown => self.scroll.down(self.scroll.page),
+            KeyCode::Up if shift => self.scroll.up(1),
+            KeyCode::Down if shift => self.scroll.down(1),
+            KeyCode::End if self.scroll.off > 0 => self.scroll.off = 0,
             KeyCode::Char('c') if ctrl => {
                 if self.current.is_some() {
                     self.cancel_all();
@@ -754,6 +843,25 @@ impl App {
         ))
     }
 
+    /// Draw one frame: transcript on top, live area + composer pinned to the bottom.
+    fn draw(&mut self, f: &mut ratatui::Frame) {
+        let area = f.area();
+        let (w, h) = (area.width as usize, area.height as usize);
+        let (mut live, cursor) = self.view(w);
+        live.truncate(h.saturating_sub(1).max(1));
+        let n = live.len() as u16;
+        let pane_h = area.height.saturating_sub(n);
+        let text = self.scroll.visible(w, pane_h as usize);
+        f.render_widget(Paragraph::new(text), Rect::new(0, 0, area.width, pane_h));
+        let lines: Vec<Line> = live.iter().map(|l| ansi::to_line(l)).collect();
+        f.render_widget(Paragraph::new(lines), Rect::new(0, pane_h, area.width, n));
+        if let Some((x, y)) = cursor
+            && y < n
+        {
+            f.set_cursor_position(Position::new(x.min(area.width.saturating_sub(1)), pane_h + y));
+        }
+    }
+
     fn view(&self, width: usize) -> (Vec<String>, Option<(u16, u16)>) {
         let mut lines = Vec::new();
         if let Some(p) = self.progress(width) {
@@ -779,8 +887,105 @@ impl App {
             lines.push(format!("{prompt} {text}"));
         }
         let tail = if self.current.is_some() { "ctrl+c cancel" } else { "ctrl+c quit" };
-        let footer = format!("  \u{23ce} download \u{b7} /f format \u{b7} /o save to \u{b7} /fav \u{b7} {tail}");
+        let footer = if self.scroll.off > 0 {
+            let what = if self.scroll.unseen { "new output" } else { "scrolled" };
+            format!("  \u{2193} {what} \u{b7} PgDn / End to follow")
+        } else {
+            format!("  \u{23ce} download \u{b7} /f format \u{b7} /o save to \u{b7} /fav \u{b7} {tail}")
+        };
         lines.push(dim(truncate(&footer, width.saturating_sub(1))));
         (lines, Some((2 + col as u16, row)))
+    }
+}
+
+const SUMMARY_MAX_FILES: usize = 20;
+
+impl App {
+    /// Codex-style recap printed to the normal screen after leaving the alternate screen.
+    fn summary_lines(&self) -> Vec<String> {
+        if self.saved.is_empty() && self.skipped == 0 && self.failed.is_empty() {
+            return Vec::new();
+        }
+        let mut parts = Vec::new();
+        if !self.saved.is_empty() {
+            parts.push(format!("{} saved", self.saved.len()));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped", self.skipped));
+        }
+        if !self.failed.is_empty() {
+            parts.push(format!("{} failed", self.failed.len()));
+        }
+        let mut out = vec![heading(&format!("yd session \u{b7} {}", parts.join(" \u{b7} ")))];
+        for p in self.saved.iter().take(SUMMARY_MAX_FILES) {
+            out.push(detail(&ui::abbrev_home(p)));
+        }
+        if self.saved.len() > SUMMARY_MAX_FILES {
+            out.push(detail(&format!("\u{2026} and {} more", self.saved.len() - SUMMARY_MAX_FILES)));
+        }
+        for f in &self.failed {
+            out.push(format!("  {} {f}", ui::red(ui::CROSS)));
+        }
+        out
+    }
+
+    fn print_summary(&self) {
+        for l in self.summary_lines() {
+            println!("{l}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(Config::default(), ToolOptions { skip_deno: true })
+    }
+
+    #[test]
+    fn summary_lists_saved_and_failures() {
+        let mut a = app();
+        assert!(a.summary_lines().is_empty());
+        a.saved = (0..25).map(|i| PathBuf::from(format!("/m/{i}.ogg"))).collect();
+        a.skipped = 1;
+        a.failed.push("url \u{b7} boom".into());
+        let l = a.summary_lines();
+        assert!(ansi::to_line(&l[0]).spans.iter().map(|s| s.content.as_ref()).collect::<String>().contains("25 saved \u{b7} 1 skipped \u{b7} 1 failed"));
+        assert_eq!(l.len(), 1 + 20 + 1 + 1);
+        assert!(l[21].contains("5 more"));
+    }
+
+    #[test]
+    fn transcript_scrolls_and_follows() {
+        let mut t = Transcript::default();
+        for i in 0..50 {
+            t.push(format!("line {i}"));
+        }
+        let v = t.visible(40, 10);
+        assert_eq!(v.len(), 10);
+        assert!(v[9].to_string().contains("line 49"));
+        t.up(5);
+        let v = t.visible(40, 10);
+        assert!(v[9].to_string().contains("line 44"));
+        // New output while scrolled up keeps the view in place and flags it.
+        t.push("line 50".into());
+        let v = t.visible(40, 10);
+        assert!(v[9].to_string().contains("line 44") && t.unseen);
+        t.up(1000);
+        t.visible(40, 10);
+        assert_eq!(t.off, 41);
+        t.down(1000);
+        assert!(t.visible(40, 10)[9].to_string().contains("line 50"));
+        assert!(!t.unseen);
+        // Short transcripts are top-aligned; long ones are capped.
+        let mut t = Transcript::default();
+        t.push("a".into());
+        assert_eq!(t.visible(40, 10).len(), 1);
+        for i in 0..4000 {
+            t.push(format!("{i}"));
+        }
+        assert!(t.lines.len() <= TRANSCRIPT_MAX + 500);
     }
 }
