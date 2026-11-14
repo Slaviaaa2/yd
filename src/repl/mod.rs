@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::Position;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -194,14 +194,22 @@ impl Transcript {
         }
     }
 
-    /// The visible slice for a pane of `h` rows (updates the scroll bookkeeping).
-    fn visible(&mut self, w: usize, h: usize) -> Vec<Line<'static>> {
+    /// The visible window of the document `transcript + live` (top-aligned; the tail when it is
+    /// taller than `h`). `cursor` is (col, row) inside `live`; the result is relative to the window.
+    fn visible(
+        &mut self,
+        w: usize,
+        h: usize,
+        live: Vec<Line<'static>>,
+        cursor: Option<(u16, u16)>,
+    ) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         if self.cache.as_ref().is_none_or(|(cw, cv, _)| *cw != w || *cv != self.ver) {
             let wrapped = self.lines.iter().flat_map(|l| ansi::wrap(ansi::to_line(l), w)).collect();
             self.cache = Some((w, self.ver, wrapped));
         }
         let all = &self.cache.as_ref().unwrap().2;
-        let total = all.len();
+        let t = all.len();
+        let total = t + live.len();
         if self.off > 0 && self.last_w == w && total > self.last_total {
             self.off += total - self.last_total;
             self.unseen = true;
@@ -214,7 +222,15 @@ impl Transcript {
             self.unseen = false;
         }
         let end = total - self.off;
-        all[end.saturating_sub(h)..end].to_vec()
+        let start = end.saturating_sub(h);
+        let rows = (start..end)
+            .map(|i| if i < t { all[i].clone() } else { live[i - t].clone() })
+            .collect();
+        let cur = cursor.and_then(|(x, y)| {
+            let row = t + y as usize;
+            (row >= start && row < end).then(|| (x, (row - start) as u16))
+        });
+        (rows, cur)
     }
 
     fn up(&mut self, n: usize) {
@@ -594,6 +610,16 @@ impl App {
             KeyCode::PageDown => self.scroll.down(self.scroll.page),
             KeyCode::Up if shift => self.scroll.up(1),
             KeyCode::Down if shift => self.scroll.down(1),
+            KeyCode::Char('p') if ctrl => {
+                if let Some(t) = self.history.prev(self.composer.text()) {
+                    self.composer.set(&t);
+                }
+            }
+            KeyCode::Char('n') if ctrl => {
+                if let Some(t) = self.history.next() {
+                    self.composer.set(&t);
+                }
+            }
             KeyCode::End if self.scroll.off > 0 => self.scroll.off = 0,
             KeyCode::Char('c') if ctrl => {
                 if self.current.is_some() {
@@ -616,16 +642,9 @@ impl App {
                 self.popup_sel = (self.popup_sel + popup.len() - 1) % popup.len();
             }
             KeyCode::Down if !popup.is_empty() => self.popup_sel = (self.popup_sel + 1) % popup.len(),
-            KeyCode::Up => {
-                if let Some(t) = self.history.prev(self.composer.text()) {
-                    self.composer.set(&t);
-                }
-            }
-            KeyCode::Down => {
-                if let Some(t) = self.history.next() {
-                    self.composer.set(&t);
-                }
-            }
+            // Mouse wheels arrive as arrow keys on the alternate screen: scroll the document.
+            KeyCode::Up => self.scroll.up(3),
+            KeyCode::Down => self.scroll.down(3),
             _ => {
                 let before = self.composer.text().len();
                 if self.composer.handle_key(&k) && self.composer.text().len() != before {
@@ -764,7 +783,7 @@ impl App {
         }
         self.push(heading("Keys"));
         self.push(detail("\u{23ce} download (several URLs may be pasted at once; they queue)"));
-        self.push(detail("\u{2191}\u{2193} history \u{b7} ctrl+u clear \u{b7} ctrl+w delete word"));
+        self.push(detail("ctrl+p/n history \u{b7} \u{2191}\u{2193} PgUp/PgDn scroll \u{b7} ctrl+u clear \u{b7} ctrl+w delete word"));
         self.push(detail("ctrl+c cancel download / quit \u{b7} ctrl+d quit"));
     }
 
@@ -843,22 +862,17 @@ impl App {
         ))
     }
 
-    /// Draw one frame: transcript on top, live area + composer pinned to the bottom.
+    /// Draw one frame: one flowing document (card, transcript, live area, composer, footer),
+    /// top-aligned; once taller than the screen the tail is shown.
     fn draw(&mut self, f: &mut ratatui::Frame) {
         let area = f.area();
         let (w, h) = (area.width as usize, area.height as usize);
-        let (mut live, cursor) = self.view(w);
-        live.truncate(h.saturating_sub(1).max(1));
-        let n = live.len() as u16;
-        let pane_h = area.height.saturating_sub(n);
-        let text = self.scroll.visible(w, pane_h as usize);
-        f.render_widget(Paragraph::new(text), Rect::new(0, 0, area.width, pane_h));
-        let lines: Vec<Line> = live.iter().map(|l| ansi::to_line(l)).collect();
-        f.render_widget(Paragraph::new(lines), Rect::new(0, pane_h, area.width, n));
-        if let Some((x, y)) = cursor
-            && y < n
-        {
-            f.set_cursor_position(Position::new(x.min(area.width.saturating_sub(1)), pane_h + y));
+        let (live, cursor) = self.view(w);
+        let live: Vec<Line> = live.iter().map(|l| ansi::to_line(l)).collect();
+        let (rows, cur) = self.scroll.visible(w, h, live, cursor);
+        f.render_widget(Paragraph::new(rows), area);
+        if let Some((x, y)) = cur {
+            f.set_cursor_position(Position::new(x.min(area.width.saturating_sub(1)), y));
         }
     }
 
@@ -958,31 +972,37 @@ mod tests {
     }
 
     #[test]
-    fn transcript_scrolls_and_follows() {
+    fn document_flows_top_aligned_and_follows() {
+        let live = || vec![Line::from("composer"), Line::from("footer")];
         let mut t = Transcript::default();
-        for i in 0..50 {
+        for i in 0..3 {
             t.push(format!("line {i}"));
         }
-        let v = t.visible(40, 10);
-        assert_eq!(v.len(), 10);
-        assert!(v[9].to_string().contains("line 49"));
+        // Short document: starts at row 0, the composer sits right after the content.
+        let (rows, cur) = t.visible(40, 10, live(), Some((2, 0)));
+        assert_eq!(rows.len(), 5);
+        assert_eq!(cur, Some((2, 3)));
+        for i in 3..50 {
+            t.push(format!("line {i}"));
+        }
+        // Tall document: the tail is shown, the composer ends up near the bottom.
+        let (rows, cur) = t.visible(40, 10, live(), Some((2, 0)));
+        assert_eq!(rows.len(), 10);
+        assert!(rows[7].to_string().contains("line 49"));
+        assert_eq!(cur, Some((2, 8)));
         t.up(5);
-        let v = t.visible(40, 10);
-        assert!(v[9].to_string().contains("line 44"));
-        // New output while scrolled up keeps the view in place and flags it.
+        let (rows, cur) = t.visible(40, 10, live(), Some((2, 0)));
+        assert!(rows[9].to_string().contains("line 46") && cur.is_none());
         t.push("line 50".into());
-        let v = t.visible(40, 10);
-        assert!(v[9].to_string().contains("line 44") && t.unseen);
+        let (rows, _) = t.visible(40, 10, live(), None);
+        assert!(rows[9].to_string().contains("line 46") && t.unseen);
         t.up(1000);
-        t.visible(40, 10);
-        assert_eq!(t.off, 41);
+        t.visible(40, 10, live(), None);
+        assert_eq!(t.off, 53 - 10);
         t.down(1000);
-        assert!(t.visible(40, 10)[9].to_string().contains("line 50"));
-        assert!(!t.unseen);
-        // Short transcripts are top-aligned; long ones are capped.
+        let (rows, _) = t.visible(40, 10, live(), None);
+        assert!(rows[9].to_string().contains("footer") && !t.unseen);
         let mut t = Transcript::default();
-        t.push("a".into());
-        assert_eq!(t.visible(40, 10).len(), 1);
         for i in 0..4000 {
             t.push(format!("{i}"));
         }

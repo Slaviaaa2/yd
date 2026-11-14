@@ -16,14 +16,14 @@ URL を貼るだけで最短でダウンロードできる CLI / 対話 TUI（�
 - `cargo run -- <URL>` / `cargo run` (REPL)
 
 ## 決定事項
-- コマンド名 `yd`。引数なし = REPL（代替スクリーン。transcript ペイン + ライブ領域 + composer。終了時に元の画面へ戻り、保存したファイルの要約だけ通常画面に出す）、`yd URL` = 前回の形式・保存先で即 DL
+- コマンド名 `yd`。引数なし = REPL（代替スクリーン。カード・transcript・ライブ領域・composer を 1 本の文書として上詰めで描画し、composer は内容の直後に出る。画面を超えたら末尾を表示。終了時に元の画面へ戻り、保存したファイルの要約だけ通常画面に出す）、`yd URL` = 前回の形式・保存先で即 DL
 - 既定ファイル名 `Uploader - Title.ext`（`%(playlist_title|.)s/%(uploader,channel|Unknown)s - %(title)s.%(ext)s`。`&{}/` 形式は `/` が `⧸` に化けるので不可）。プレイリストは `<playlist名>/` 配下。`v=` と `list=` 両方ある URL は既定で単体（`--playlist` で全体）
 - 既存ファイルは削除しない。yt-dlp の既定どおりスキップ、`--force` で上書き
 - 見た目は Codex CLI 基調: 角丸枠のヘッダ、`›` プロンプト、`•` 見出し + `└` 詳細、dim グレー中心、アクセントは cyan、成功 ✔ green / 失敗 ✘ red。絵文字は使わない
 - UI テキストは日本語ではなく英語（短く）。README は日本語
 - 外部ツールは tools dir (`~/.local/share/yd/tools`) → PATH → 自動 DL。PATH の yt-dlp は 90 日より古ければ使わない
 - 保存先は `f:N`（N 番目のお気に入り）/ `r:N`（N 番目の最近）で参照でき、`config::resolve_dest` に一本化（0 始まり、一覧の表示順）。お気に入り名に `:` は不可。REPL は `URL /f x /o y /force` の行内修飾子でその行の DL だけ上書きでき、last_* は変えず recent にだけ記録
-- ワンショット出力とピッカー（`-p`）は通常画面のインライン表示のまま。REPL の transcript は PgUp/PgDn・Shift+↑↓ でスクロール、End で末尾追従に戻る
+- ワンショット出力とピッカー（`-p`）は通常画面のインライン表示のまま。REPL は PgUp/PgDn・↑↓（空 composer 時はホイール相当）でスクロール、End で末尾追従に戻る。入力履歴は Ctrl+P / Ctrl+N
 
 ## やらないこと
 - マウスキャプチャ（テキスト選択を残す）、GUI、Ytdlp.NET 等ラッパーライブラリ
