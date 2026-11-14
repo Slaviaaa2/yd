@@ -539,20 +539,20 @@ impl DestPicker {
             paths.push(Some(current.display().to_string()));
             cur = Some(0);
         }
-        for f in &cfg.favorites {
+        for (i, f) in cfg.favorites.iter().enumerate() {
             if is_cur(&f.path) {
                 cur = Some(items.len());
             }
-            let mut it = Item::new(format!("\u{2605} {}", f.name), super::abbrev_home(&f.path));
+            let mut it = Item::new(format!("f:{i} \u{2605} {}", f.name), super::abbrev_home(&f.path));
             it.search = f.path.display().to_string();
             items.push(it);
             paths.push(Some(f.path.display().to_string()));
         }
-        for r in cfg.recent.iter().filter(|r| !fav_paths.contains(r)) {
+        for (i, r) in cfg.recent.iter().enumerate().filter(|(_, r)| !fav_paths.contains(r)) {
             if is_cur(r) {
                 cur = Some(items.len());
             }
-            let mut it = Item::new(format!("\u{b7} {}", super::abbrev_home(r)), "");
+            let mut it = Item::new(format!("r:{i} \u{b7} {}", super::abbrev_home(r)), "");
             it.search = r.display().to_string();
             items.push(it);
             paths.push(Some(r.display().to_string()));
@@ -746,7 +746,7 @@ mod tests {
         cfg.recent = vec![PathBuf::from("/m"), PathBuf::from("/r1"), PathBuf::from("/r2")];
         let mut dp = DestPicker::new(&cfg, Path::new("/r1"));
         let l: Vec<String> = dp.picker.items.iter().map(|i| i.label.clone()).collect();
-        assert_eq!(l, ["\u{2605} music", "\u{b7} /r1", "\u{b7} /r2", "+ Enter a path\u{2026}"]);
+        assert_eq!(l, ["f:0 \u{2605} music", "r:1 \u{b7} /r1", "r:2 \u{b7} /r2", "+ Enter a path\u{2026}"]);
         assert_eq!(dp.picker.selected(), Some(1));
         // Filtering keeps the sticky row; Enter on it switches to the input stage.
         for c in "r2".chars() {

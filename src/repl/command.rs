@@ -91,10 +91,74 @@ pub fn extract_urls(text: &str) -> Option<Vec<String>> {
     Some(toks.into_iter().map(String::from).collect())
 }
 
+/// URLs plus one-off modifiers from a single line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Inline {
+    pub urls: Vec<String>,
+    pub format: Option<String>,
+    pub dest: Option<String>,
+    pub force: bool,
+}
+
+fn takes_arg(tok: &str) -> bool {
+    matches!(tok.to_ascii_lowercase().as_str(), "/f" | "/format" | "/o" | "/out")
+}
+
+/// Does the line contain a URL outside of modifier arguments?
+fn has_url(toks: &[&str]) -> bool {
+    let mut i = 0;
+    while i < toks.len() {
+        if takes_arg(toks[i]) {
+            i += 2;
+            continue;
+        }
+        if looks_like_url(toks[i]) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Parse `URL... [/f spec] [/o dest] [/force]` in any order.
+pub fn parse_inline(line: &str) -> Result<Inline, String> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let mut out = Inline::default();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        let lower = t.to_ascii_lowercase();
+        if takes_arg(t) {
+            let Some(arg) = toks.get(i + 1) else {
+                return Err(format!("{t} needs a value"));
+            };
+            let slot = if matches!(lower.as_str(), "/f" | "/format") { &mut out.format } else { &mut out.dest };
+            if slot.is_some() {
+                return Err(format!("{t} given twice"));
+            }
+            *slot = Some((*arg).to_string());
+            i += 2;
+        } else if lower == "/force" {
+            out.force = true;
+            i += 1;
+        } else if t.starts_with('/') && !t.contains('.') {
+            return Err(format!("unknown modifier {t} (use /f, /o, /force)"));
+        } else if looks_like_url(t) {
+            out.urls.push(t.to_string());
+            i += 1;
+        } else {
+            return Err(format!("not a URL: {}", t));
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 pub enum Parsed {
     Empty,
     Urls(Vec<String>),
+    /// URLs with modifiers (`Err` = invalid line).
+    Inline(Result<Inline, String>),
     Command { cmd: &'static Cmd, args: String },
     UnknownCommand(String),
     NotUrl(String),
@@ -104,6 +168,13 @@ pub fn parse_input(line: &str) -> Parsed {
     let line = line.trim();
     if line.is_empty() {
         return Parsed::Empty;
+    }
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if has_url(&toks) {
+        return match parse_inline(line) {
+            Ok(i) if i.format.is_none() && i.dest.is_none() && !i.force => Parsed::Urls(i.urls),
+            r => Parsed::Inline(r),
+        };
     }
     if let Some(rest) = line.strip_prefix('/') {
         let (word, args) = match rest.split_once(char::is_whitespace) {
@@ -207,6 +278,35 @@ mod tests {
         assert!(matches!(parse_input("/zzz a b"), Parsed::UnknownCommand(w) if w == "zzz"));
         assert!(matches!(parse_input("https://x.com/a https://x.com/b"), Parsed::Urls(u) if u.len() == 2));
         assert!(matches!(parse_input("hello world"), Parsed::NotUrl(w) if w == "hello"));
+    }
+
+    #[test]
+    fn inline_modifiers() {
+        let p = |l: &str| parse_inline(l);
+        let r = p("https://youtu.be/x /f ogg /o f:0").unwrap();
+        assert_eq!(r.urls, ["https://youtu.be/x"]);
+        assert_eq!((r.format.as_deref(), r.dest.as_deref(), r.force), (Some("ogg"), Some("f:0"), false));
+        let r = p("/f mp4:720 /o ~/clips https://a.com/1 https://a.com/2").unwrap();
+        assert_eq!(r.urls.len(), 2);
+        assert_eq!((r.format.as_deref(), r.dest.as_deref()), (Some("mp4:720"), Some("~/clips")));
+        let r = p("https://a.com/1 /FORCE /out /mnt/data.x/y").unwrap();
+        assert!(r.force);
+        assert_eq!(r.dest.as_deref(), Some("/mnt/data.x/y"));
+        assert!(p("https://a.com/1 /f").is_err());
+        assert!(p("https://a.com/1 /f a /format b").is_err());
+        assert!(p("https://a.com/1 /zzz").is_err());
+        assert!(p("https://a.com/1 hello").is_err());
+    }
+
+    #[test]
+    fn inline_detection() {
+        assert!(matches!(parse_input("https://a.com/1 /f ogg"), Parsed::Inline(Ok(_))));
+        assert!(matches!(parse_input("/f ogg https://a.com/1"), Parsed::Inline(Ok(_))));
+        assert!(matches!(parse_input("https://a.com/1 /zzz"), Parsed::Inline(Err(_))));
+        // No URL: the normal commands, even when an argument looks path-like.
+        assert!(matches!(parse_input("/f ogg"), Parsed::Command { .. }));
+        assert!(matches!(parse_input("/o /mnt/a.b/c"), Parsed::Command { .. }));
+        assert!(matches!(parse_input("https://a.com/1"), Parsed::Urls(_)));
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub struct Cli {
     #[arg(short, long, value_name = "SPEC")]
     pub format: Option<String>,
 
-    /// Destination: favorite name or directory (created if missing)
+    /// Destination: favorite name, f:N / r:N (Nth favorite / recent), or directory (created if missing)
     #[arg(short, long, value_name = "DEST")]
     pub out: Option<String>,
 

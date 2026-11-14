@@ -105,13 +105,13 @@ pub fn fav_list_lines(cfg: &crate::config::Config) -> Vec<String> {
     if cfg.favorites.is_empty() {
         out.push(detail("none (yd fav add <name> [path])"));
     }
-    for f in &cfg.favorites {
-        out.push(detail(&format!("{}  {}", f.name, abbrev_home(&f.path))));
+    for (i, f) in cfg.favorites.iter().enumerate() {
+        out.push(detail(&format!("f:{i}  {}  {}", f.name, abbrev_home(&f.path))));
     }
     if !cfg.recent.is_empty() {
         out.push(heading("Recent"));
-        for r in &cfg.recent {
-            out.push(detail(&abbrev_home(r)));
+        for (i, r) in cfg.recent.iter().enumerate() {
+            out.push(detail(&format!("r:{i}  {}", abbrev_home(r))));
         }
     }
     out

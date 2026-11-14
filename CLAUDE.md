@@ -22,6 +22,7 @@ URL を貼るだけで最短でダウンロードできる CLI / インライン
 - 見た目は Codex CLI 基調: 角丸枠のヘッダ、`›` プロンプト、`•` 見出し + `└` 詳細、dim グレー中心、アクセントは cyan、成功 ✔ green / 失敗 ✘ red。絵文字は使わない
 - UI テキストは日本語ではなく英語（短く）。README は日本語
 - 外部ツールは tools dir (`~/.local/share/yd/tools`) → PATH → 自動 DL。PATH の yt-dlp は 90 日より古ければ使わない
+- 保存先は `f:N`（N 番目のお気に入り）/ `r:N`（N 番目の最近）で参照でき、`config::resolve_dest` に一本化（0 始まり、一覧の表示順）。お気に入り名に `:` は不可。REPL は `URL /f x /o y /force` の行内修飾子でその行の DL だけ上書きでき、last_* は変えず recent にだけ記録
 
 ## やらないこと
 - フルスクリーン TUI、GUI、Ytdlp.NET 等ラッパーライブラリ

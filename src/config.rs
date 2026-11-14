@@ -105,8 +105,8 @@ impl Config {
     /// Add (or replace, keeping position) a favorite. `path` is stored absolute.
     pub fn add_favorite(&mut self, name: &str, path: &str) -> Result<PathBuf> {
         let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\', '~']) || name.starts_with('.') {
-            bail!("invalid favorite name '{name}' (no slashes, no leading dot)");
+        if name.is_empty() || name.contains(['/', '\\', '~', ':']) || name.starts_with('.') {
+            bail!("invalid favorite name '{name}' (no slashes or colons, no leading dot)");
         }
         let path = absolutize(path)?;
         if let Some(f) = self.favorites.iter_mut().find(|f| f.name.eq_ignore_ascii_case(name)) {
@@ -135,7 +135,30 @@ impl Config {
         self.recent.truncate(MAX_RECENT);
     }
 
-    /// Resolve `-o` style input: favorite name, or a path (`~` expanded, relative made absolute).
+    /// `f:N` / `r:N` (0-based index into favorites / recent as listed). `None` if `s` is not that form.
+    fn resolve_index(&self, s: &str) -> Option<Result<PathBuf>> {
+        let (kind, n) = s.split_once(':')?;
+        if !matches!(kind, "f" | "r") || n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: usize = n.parse().unwrap_or(usize::MAX);
+        let (what, len, found) = if kind == "f" {
+            ("favorite", self.favorites.len(), self.favorites.get(n).map(|f| f.path.clone()))
+        } else {
+            ("recent folder", self.recent.len(), self.recent.get(n).cloned())
+        };
+        Some(found.ok_or_else(|| {
+            if len == 0 {
+                anyhow::anyhow!("no {what} {s}: none saved yet")
+            } else if len == 1 {
+                anyhow::anyhow!("no {what} {s}: 1 saved ({kind}:0)")
+            } else {
+                anyhow::anyhow!("no {what} {s}: {len} saved ({kind}:0..{kind}:{})", len - 1)
+            }
+        }))
+    }
+
+    /// Resolve `-o` style input: `f:N` / `r:N`, favorite name, or a path (`~` expanded, relative made absolute).
     /// The directory is created if missing. A bare word that is no favorite is an error
     /// (use `./name` for a relative directory).
     pub fn resolve_dest(&self, s: &str) -> Result<PathBuf> {
@@ -144,7 +167,9 @@ impl Config {
             bail!("empty destination");
         }
         let is_pathlike = s.contains(['/', '\\']) || s.starts_with(['~', '.']);
-        let dir = if let Some(f) = self.favorite(s) {
+        let dir = if let Some(r) = self.resolve_index(s) {
+            r?
+        } else if let Some(f) = self.favorite(s) {
             f.path.clone()
         } else if is_pathlike {
             absolutize(s)?
@@ -222,5 +247,26 @@ mod tests {
         });
         assert_eq!(c.resolve_dest("m").unwrap(), Path::new("/tmp"));
         assert!(c.resolve_dest("nope").is_err());
+    }
+
+    #[test]
+    fn index_references() {
+        let mut c = Config::default();
+        c.favorites.push(Favorite {
+            name: "m".into(),
+            path: PathBuf::from("/tmp"),
+        });
+        c.recent = vec![PathBuf::from("/var"), PathBuf::from("/tmp")];
+        assert_eq!(c.resolve_dest("f:0").unwrap(), Path::new("/tmp"));
+        assert_eq!(c.resolve_dest("r:0").unwrap(), Path::new("/var"));
+        assert_eq!(c.resolve_dest("r:1").unwrap(), Path::new("/tmp"));
+        let e = c.resolve_dest("f:9").unwrap_err().to_string();
+        assert!(e.contains("1 saved"), "{e}");
+        assert!(c.resolve_dest("r:2").is_err());
+        assert!(Config::default().resolve_dest("f:0").unwrap_err().to_string().contains("none"));
+        // Not index forms: treated as names / errors, never as indices.
+        assert!(c.resolve_dest("f0").is_err());
+        assert!(c.resolve_dest("f:x").is_err());
+        assert!(c.add_favorite("f:0", "/x").is_err());
     }
 }

@@ -53,6 +53,8 @@ enum Msg {
 struct QueuedJob {
     job: Job,
     spec: FormatSpec,
+    /// One-off overrides shown on the info line (`ogg · best → ~/Music force`).
+    note: Option<String>,
 }
 
 fn spawn_worker(opts: ToolOptions, cancel: Arc<AtomicBool>, jobs: Receiver<QueuedJob>, tx: Sender<Msg>) {
@@ -96,6 +98,7 @@ struct Running {
     started: Instant,
     label: String,
     dest: PathBuf,
+    note: Option<String>,
     cancelled: bool,
 }
 
@@ -331,7 +334,13 @@ impl App {
                     (Some(i), Some(n)) if n > 1 => format!("[{i}/{n}] {}", info.title),
                     _ => info.title.clone(),
                 };
-                let lines = oneshot::info_lines(&info, &mut self.playlist);
+                let mut lines = oneshot::info_lines(&info, &mut self.playlist);
+                if let Some(note) = &run.note {
+                    match lines.last_mut() {
+                        Some(l) if l.contains(ui::BRANCH) => l.push_str(&dim(format!(" \u{b7} {note}"))),
+                        _ => lines.push(detail(note)),
+                    }
+                }
                 self.scroll.extend(lines);
             }
             Event::Progress {
@@ -389,16 +398,31 @@ impl App {
     // ----- queue -------------------------------------------------------------------------
 
     fn enqueue(&mut self, url: &str) {
+        self.enqueue_with(url, self.spec, self.dest.clone(), false);
+    }
+
+    fn enqueue_with(&mut self, url: &str, spec: FormatSpec, dest: PathBuf, force: bool) {
+        let mut note = Vec::new();
+        if spec != self.spec {
+            note.push(spec.to_string());
+        }
+        if dest != self.dest {
+            note.push(format!("\u{2192} {}", ui::abbrev_home(&dest)));
+        }
+        if force {
+            note.push("force".to_string());
+        }
+        let note = (!note.is_empty()).then(|| note.join(" "));
         let job = Job {
             url: url.to_string(),
-            dest: self.dest.clone(),
+            dest,
             template: self.cfg.template.clone().unwrap_or_else(|| DEFAULT_TEMPLATE.to_string()),
-            force: false,
+            force,
             playlist: false,
             cookies_from_browser: None,
             extra: Vec::new(),
         };
-        self.queue.push_back(QueuedJob { job, spec: self.spec });
+        self.queue.push_back(QueuedJob { job, spec, note });
         self.pump();
     }
 
@@ -417,6 +441,7 @@ impl App {
             started: Instant::now(),
             label: q.spec.to_string(),
             dest: q.job.dest.clone(),
+            note: q.note.clone(),
             cancelled: false,
         });
         let _ = self.job_tx.send(q);
@@ -543,6 +568,15 @@ impl App {
                     self.enqueue(&u);
                 }
             }
+            Parsed::Inline(Err(msg)) => {
+                self.push(dim(format!("\u{203a} {text}")));
+                self.push(error_line(&msg));
+                self.push(detail("usage: URL... [/f format] [/o folder] [/force]"));
+            }
+            Parsed::Inline(Ok(inl)) => {
+                self.push(dim(format!("\u{203a} {text}")));
+                self.enqueue_inline(inl);
+            }
             Parsed::Command { cmd, args } => {
                 self.push(dim(format!("\u{203a} {text}")));
                 self.run_command(cmd.name, &args);
@@ -557,6 +591,23 @@ impl App {
                 self.push(error_line(&format!("not a URL: {}", truncate(&tok, 40))));
                 self.push(detail("paste a URL, or /help for commands"));
             }
+        }
+    }
+
+    /// Validate every override first; enqueue nothing when any is bad.
+    fn enqueue_inline(&mut self, inl: command::Inline) {
+        let spec = match inl.format.as_deref().map(FormatSpec::parse) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => return self.push(error_line(&e)),
+            None => self.spec,
+        };
+        let dest = match inl.dest.as_deref().map(|d| self.cfg.resolve_dest(d)) {
+            Some(Ok(d)) => d.components().collect(),
+            Some(Err(e)) => return self.push(error_line(&format!("{e:#}"))),
+            None => self.dest.clone(),
+        };
+        for u in &inl.urls {
+            self.enqueue_with(u, spec, PathBuf::clone(&dest), inl.force);
         }
     }
 
