@@ -1,73 +1,103 @@
-# YtdlpCLI
+# yd
 
-yt-dlp のかんたんな CLI ラッパー。Windows / Linux / macOS で動きます。
+URL を貼るだけで最短でダウンロードできる yt-dlp フロントエンド。
+ワンショットの CLI と、Codex CLI 風のインライン対話モードを持つ単一バイナリです。
 
-## 特徴
+```
+╭───────────────────────────────────────────────╮
+│ >_ yd (v1.0.0)                                │
+│                                               │
+│ format:   mp3 · 320k             /f to change │
+│ save to:  ~/Music  ★ music       /o to change │
+╰───────────────────────────────────────────────╯
+› https://www.youtube.com/watch?v=jNQXAC9IVRw
+• Me at the zoo
+  └ jawed · 0:19 · Youtube
+✔ Saved ~/Music/jawed - Me at the zoo.mp3
+  └ 524.7 KiB · mp3 · 320k · 2s
+```
 
-**yt-dlp・ffmpeg・deno は自動で用意されます。** 手動での配置は不要です。
-起動時に次の順で探し、見つからなければ実行環境に合ったビルドをダウンロードして `tools/` に置きます。
+## インストール
 
-1. `tools/` ディレクトリ
-2. PATH 上の既存インストール（`apt install ffmpeg` などで入れたもの）
-3. 自動ダウンロード
+```sh
+cargo install --path .
+```
 
-| ツール | 用途 | 取得元 |
-| --- | --- | --- |
-| yt-dlp | ダウンロード本体 | [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) |
-| ffmpeg / ffprobe | 映像と音声の結合、音声抽出、メタデータ埋め込み | [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)（macOS は [evermeet.cx](https://evermeet.cx/ffmpeg/)） |
-| deno | yt-dlp が YouTube の JavaScript チャレンジを解くのに使用 | [denoland/deno](https://github.com/denoland/deno) |
-
-初回のみ合計 400MB 程度のダウンロードが発生します。2 回目以降は `tools/` のものを使います。
+yt-dlp・ffmpeg・deno は自動で用意されます（`~/.local/share/yd/tools` → PATH → 自動ダウンロードの順）。
+PATH 上の yt-dlp は 90 日より古ければ使わず、新しいものを取得します。`yd update` で更新できます。
 
 ## 使い方
 
-```
-ytdlp-cli [オプション] [URL]
-
-  -o, --output <DIR>      保存先ディレクトリ
-  -a, --audio [FORMAT]    音声のみ (既定: wav)
-  -v, --video             動画としてダウンロード
-  -k, --keep              同じ動画 ID の既存ファイルを削除しない
-      --no-deno           JS ランタイム (deno) を用意しない
-  -h, --help              ヘルプを表示
-```
-
-省略した項目は対話プロンプトで入力します。引数なしで起動すれば従来どおり全て対話で進みます。
-
 ```sh
-# 対話モード
-ytdlp-cli
-
-# 動画をダウンロード
-ytdlp-cli -o ~/Videos "https://www.youtube.com/watch?v=..."
-
-# mp3 で音声のみ
-ytdlp-cli -o ~/Music -a mp3 "https://www.youtube.com/watch?v=..."
+yd                         # 対話モード（URL を貼って Enter。DL 中も次の URL を貼ればキューに入る）
+yd URL                     # 前回の形式・保存先ですぐ DL
+yd -f mp3:320 -o music URL # 形式と保存先（お気に入り名 or パス）を指定
+yd -p URL                  # 形式と保存先をピッカーで選ぶ
+yd URL1 URL2 ...           # 複数をまとめて
+yd URL -- --limit-rate 2M  # -- 以降は yt-dlp にそのまま渡す
 ```
 
-対応する音声フォーマット: `aac` `alac` `flac` `m4a` `mp3` `opus` `vorbis` `wav`
+| オプション | 内容 |
+| --- | --- |
+| `-f, --format <SPEC>` | 形式（下表）。省略時は前回の形式 |
+| `-o, --out <DEST>` | お気に入り名またはディレクトリ。省略時は前回の保存先 |
+| `-p, --pick` | 形式・保存先をピッカーで選ぶ |
+| `-t, --template <T>` | 出力ファイル名テンプレート |
+| `--force` | 既存ファイルを上書き（既定はスキップ） |
+| `--playlist` | `v=` と `list=` 両方ある URL でプレイリスト全体を DL |
+| `--cookies <BROWSER>` | ブラウザの Cookie を使う（`firefox`, `chrome` など） |
+| `--no-deno` | deno を用意しない |
 
-出力ファイル名は動画なら `%(upload_date)s_%(id)s [%(resolution)s].%(ext)s`、
-音声なら `%(upload_date)s_%(id)s.%(ext)s` になります。
-同じ動画 ID のファイルが保存先にあると既定で削除してから取得し直します（`-k` で抑止）。
+### 形式
 
-## 対応環境
+`<形式>[:<品質>]` で指定します。
 
-| OS | アーキテクチャ | 備考 |
+| 種類 | 形式 | 品質 |
 | --- | --- | --- |
-| Windows | x64 / arm64 | |
-| Linux (glibc) | x64 / arm64 | |
-| Linux (glibc) | armv7 | ffmpeg・deno の公式ビルドが無いため別途インストールが必要 |
-| Linux (musl / Alpine) | x64 / arm64 | 同上（`apk add ffmpeg`） |
-| macOS | x64 / arm64 | ffmpeg は x86_64 ビルド（Apple Silicon では Rosetta 2 経由） |
+| 音声 | `mp3` `m4a` `aac` `opus` `ogg` `flac` `wav` `alac` `aiff` | kbps（`320` `256` `192` `128`）、既定 `best` |
+| 動画 | `mp4` `mkv` `webm` `mov` `avi` `gif` | 高さ（`2160`/`4k` `1440`/`2k` `1080` `720` `480` `360`）、既定 `best` |
+| 無変換 | `original` | — |
 
-ffmpeg が用意できない場合も、単一ファイルで済む形式（`best`）でのダウンロードは続行します。
+例: `mp3:320`、`flac`、`mp4:1080`、`mkv:4k`、`gif:360`
 
-## ビルド
+### 保存先（お気に入り・最近）
 
 ```sh
-dotnet build
-dotnet run --project YtdlpCLI -- --help
+yd fav add music ~/Music   # お気に入り登録（パス省略でカレント）
+yd fav ls                  # お気に入りと最近使った保存先（10 件）
+yd fav rm music
 ```
 
-.NET 10 SDK が必要です。
+対話モードでは `/o` でピッカー（★ お気に入り、· 最近、+ パス入力・Tab 補完）を開けます。
+
+### 対話モードのコマンド
+
+| コマンド | 内容 |
+| --- | --- |
+| `/f [spec]` | 形式を変更（引数なしでピッカー） |
+| `/o [fav\|path]` | 保存先を変更（引数なしでピッカー） |
+| `/fav <name>` / `/fav rm <name>` / `/fav` | 今の保存先をお気に入り登録 / 削除 / 一覧 |
+| `/open` | 保存先をファイルマネージャで開く |
+| `/help`, `/q` | ヘルプ、終了 |
+
+`Ctrl+C` は DL 中ならキャンセル（キューも破棄）、待機中なら終了します。
+
+## ファイル名
+
+既定は `アップロード者 - タイトル.拡張子`。プレイリストは `<プレイリスト名>/` に入ります。
+同名ファイルがあればスキップします（`--force` で上書き）。
+変更は `-t` か設定ファイルの `template` で（yt-dlp の出力テンプレート書式）。
+
+## 設定
+
+`~/.config/yd/config.toml`（`yd config` で場所と中身を表示）。お気に入り、最近の保存先、前回の形式・保存先、テンプレートを保存します。
+
+## 開発
+
+```sh
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+`YD_CONFIG_DIR` / `YD_TOOLS_DIR` で設定とツールの置き場所を差し替えられます。
