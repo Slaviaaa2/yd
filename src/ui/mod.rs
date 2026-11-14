@@ -1,7 +1,11 @@
 //! Codex-CLI-like styling helpers shared by the one-shot output and the interactive mode.
 #![allow(dead_code)] // helpers also used by the interactive mode
 
+pub mod ansi;
+pub mod input;
 pub mod oneshot;
+pub mod picker;
+pub mod term;
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -93,6 +97,24 @@ pub fn progress_bar(percent: f64, width: usize) -> String {
     let head = cyan(format!("{}\u{257a}", "\u{2501}".repeat(filled)));
     let rest = dim("\u{2501}".repeat(width - filled - 1));
     format!("{head}{rest}")
+}
+
+/// Lines of `yd fav ls` / `/fav`: favorites, then recent directories.
+pub fn fav_list_lines(cfg: &crate::config::Config) -> Vec<String> {
+    let mut out = vec![heading("Favorites")];
+    if cfg.favorites.is_empty() {
+        out.push(detail("none (yd fav add <name> [path])"));
+    }
+    for f in &cfg.favorites {
+        out.push(detail(&format!("{}  {}", f.name, abbrev_home(&f.path))));
+    }
+    if !cfg.recent.is_empty() {
+        out.push(heading("Recent"));
+        for r in &cfg.recent {
+            out.push(detail(&abbrev_home(r)));
+        }
+    }
+    out
 }
 
 /// Replace a leading home dir with `~`.

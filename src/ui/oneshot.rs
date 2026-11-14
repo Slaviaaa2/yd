@@ -8,7 +8,7 @@ use crate::tools::ToolEvent;
 use crate::ytdlp::{Event, Info};
 
 const REDRAW_EVERY: Duration = Duration::from_millis(100);
-const BAR_WIDTH: usize = 20;
+pub const BAR_WIDTH: usize = 20;
 
 fn flush() {
     let _ = std::io::stdout().flush();
@@ -54,7 +54,7 @@ impl Live {
     }
 }
 
-fn stage_label(pp: &str) -> Option<&'static str> {
+pub fn stage_label(pp: &str) -> Option<&'static str> {
     Some(match pp {
         "ExtractAudio" => "Converting audio",
         "Merger" => "Merging streams",
@@ -130,20 +130,16 @@ impl Printer {
             }
             Event::Done { path, size } => {
                 self.live.clear();
-                println!("{}", ok_line(&format!("Saved {}", abbrev_home(&path))));
-                let mut d = Vec::new();
-                if let Some(s) = size {
-                    d.push(fmt_bytes(s));
+                for l in done_lines(&path, size, &self.format_label, self.started.elapsed().as_secs()) {
+                    println!("{l}");
                 }
-                d.push(self.format_label.clone());
-                d.push(fmt_elapsed(self.started.elapsed().as_secs()));
-                println!("{}", detail(&d.join(" \u{b7} ")));
                 flush();
             }
             Event::AlreadyDownloaded { path } => {
                 self.live.clear();
-                println!("{}", ok_line(&format!("Already downloaded {}", abbrev_home(&path))));
-                println!("{}", detail("use --force to download again"));
+                for l in already_lines(&path) {
+                    println!("{l}");
+                }
                 flush();
             }
             Event::Warning(msg) => {
@@ -165,36 +161,67 @@ impl Printer {
     }
 
     fn print_info(&mut self, info: &Info) {
-        let in_list = info.n_entries.is_some_and(|n| n > 1) && info.playlist_title.is_some();
-        if in_list {
-            let pt = info.playlist_title.clone().unwrap_or_default();
-            if self.playlist.as_deref() != Some(pt.as_str()) {
-                println!("{}", heading(&format!("{pt} ({} items)", info.n_entries.unwrap_or(0))));
-                self.playlist = Some(pt);
-            }
-            let idx = info
-                .playlist_index
-                .map(|i| format!("[{i}/{}] ", info.n_entries.unwrap_or(0)))
-                .unwrap_or_default();
-            println!("  {}{}", dim(idx), info.title);
-        } else {
-            println!("{}", heading(&info.title));
-            let mut d = Vec::new();
-            if let Some(u) = &info.uploader {
-                d.push(u.clone());
-            }
-            if let Some(s) = info.duration {
-                d.push(fmt_duration(s));
-            }
-            if let Some(e) = &info.extractor {
-                d.push(e.clone());
-            }
-            if !d.is_empty() {
-                println!("{}", detail(&d.join(" \u{b7} ")));
-            }
+        for l in info_lines(info, &mut self.playlist) {
+            println!("{l}");
         }
         flush();
     }
+}
+
+/// Lines announcing a download (`• Title` + `└ uploader · 0:19 · Youtube`, or a playlist entry).
+/// `playlist` remembers the last playlist heading so it is printed once.
+pub fn info_lines(info: &Info, playlist: &mut Option<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let in_list = info.n_entries.is_some_and(|n| n > 1) && info.playlist_title.is_some();
+    if in_list {
+        let pt = info.playlist_title.clone().unwrap_or_default();
+        if playlist.as_deref() != Some(pt.as_str()) {
+            out.push(heading(&format!("{pt} ({} items)", info.n_entries.unwrap_or(0))));
+            *playlist = Some(pt);
+        }
+        let idx = info
+            .playlist_index
+            .map(|i| format!("[{i}/{}] ", info.n_entries.unwrap_or(0)))
+            .unwrap_or_default();
+        out.push(format!("  {}{}", dim(idx), info.title));
+    } else {
+        out.push(heading(&info.title));
+        let mut d = Vec::new();
+        if let Some(u) = &info.uploader {
+            d.push(u.clone());
+        }
+        if let Some(s) = info.duration {
+            d.push(fmt_duration(s));
+        }
+        if let Some(e) = &info.extractor {
+            d.push(e.clone());
+        }
+        if !d.is_empty() {
+            out.push(detail(&d.join(" \u{b7} ")));
+        }
+    }
+    out
+}
+
+/// `✔ Saved <path>` + `└ size · format · time`.
+pub fn done_lines(path: &Path, size: Option<u64>, format_label: &str, elapsed_secs: u64) -> Vec<String> {
+    let mut d = Vec::new();
+    if let Some(s) = size {
+        d.push(fmt_bytes(s));
+    }
+    d.push(format_label.to_string());
+    d.push(fmt_elapsed(elapsed_secs));
+    vec![
+        ok_line(&format!("Saved {}", abbrev_home(path))),
+        detail(&d.join(" \u{b7} ")),
+    ]
+}
+
+pub fn already_lines(path: &Path) -> Vec<String> {
+    vec![
+        ok_line(&format!("Already downloaded {}", abbrev_home(path))),
+        detail("use --force to download again"),
+    ]
 }
 
 /// Renders tool setup events. Quiet unless something is downloaded or goes wrong

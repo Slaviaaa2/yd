@@ -6,6 +6,7 @@ mod tools;
 mod ui;
 mod ytdlp;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +62,12 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
         None => {}
     }
     if cli.pick {
-        return Ok(usage_error("--pick: coming soon"));
+        if cli.urls.is_empty() {
+            return Ok(usage_error("--pick needs at least one URL (interactive mode has /f and /o)"));
+        }
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            return Ok(usage_error("--pick needs an interactive terminal"));
+        }
     }
 
     let mut cfg = load_config();
@@ -78,13 +84,27 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
         },
         None => FormatSpec::DEFAULT,
     };
-    let dest = match cli.out.as_deref() {
+    let mut spec = spec;
+    let mut dest = match cli.out.as_deref() {
         Some(o) => match cfg.resolve_dest(o) {
             Ok(d) => d,
             Err(e) => return Ok(usage_error(&format!("{e:#}"))),
         },
         None => cfg.default_dest(),
     };
+    if cli.pick {
+        let Some(picked) = ui::picker::pick_format(&spec)? else {
+            eprintln!("{}", ui::error_line("Cancelled"));
+            return Ok(EXIT_INTERRUPTED);
+        };
+        spec = picked;
+        let Some(picked) = ui::picker::pick_dest(&cfg, &dest)? else {
+            eprintln!("{}", ui::error_line("Cancelled"));
+            return Ok(EXIT_INTERRUPTED);
+        };
+        dest = picked;
+        println!("{}", ui::dim(format!("  {spec} \u{2192} {}", ui::abbrev_home(&dest))));
+    }
     let template =
         cli.template.clone().or_else(|| cfg.template.clone()).unwrap_or_else(|| format::DEFAULT_TEMPLATE.to_string());
 
@@ -158,18 +178,8 @@ fn fav(action: FavAction) -> anyhow::Result<u8> {
             }
         }
         FavAction::Ls => {
-            println!("{}", ui::heading("Favorites"));
-            if cfg.favorites.is_empty() {
-                println!("{}", ui::detail("none (yd fav add <name> [path])"));
-            }
-            for f in &cfg.favorites {
-                println!("{}", ui::detail(&format!("{}  {}", f.name, ui::abbrev_home(&f.path))));
-            }
-            if !cfg.recent.is_empty() {
-                println!("{}", ui::heading("Recent"));
-                for r in &cfg.recent {
-                    println!("{}", ui::detail(&ui::abbrev_home(r)));
-                }
+            for l in ui::fav_list_lines(&cfg) {
+                println!("{l}");
             }
         }
     }

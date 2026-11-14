@@ -1,0 +1,735 @@
+//! Interactive inline mode (`yd` without URLs): composer, download queue, slash commands, pickers.
+//! Finished output scrolls into the normal terminal scrollback; only the live area is redrawn.
+
+mod command;
+mod view;
+
+use std::collections::VecDeque;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, bail};
+use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::config::Config;
+use crate::format::{DEFAULT_TEMPLATE, FormatSpec};
+use crate::tools::{self, ToolEvent, ToolOptions, Tools};
+use crate::ui::input::{History, LineEditor};
+use crate::ui::picker::{DestPicker, FormatPicker, Interactive, Step};
+use crate::ui::term::InlineTerm;
+use crate::ui::{self, detail, dim, error_line, heading, ok_line, oneshot, truncate, warn_line};
+use crate::ytdlp::{self, Event, Job, Outcome};
+use command::{FavArgs, Parsed};
+
+/// Entry point for `yd` without URLs. Returns the process exit code.
+pub fn run(config: Config, tool_opts: ToolOptions) -> Result<u8> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("interactive mode needs a terminal (pass a URL to download without one)");
+    }
+    let mut term = InlineTerm::new(3)?;
+    let mut app = App::new(config, tool_opts);
+    app.print_card(term.width());
+    let result = app.event_loop(&mut term);
+    app.shutdown(&mut term);
+    term.finish();
+    result.map(|()| 0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Worker
+// ---------------------------------------------------------------------------------------------
+
+enum Msg {
+    Tool(ToolEvent),
+    ToolsReady(Result<(), String>),
+    Ev(Event),
+    Finished(Result<Outcome, String>),
+}
+
+struct QueuedJob {
+    job: Job,
+    spec: FormatSpec,
+}
+
+fn spawn_worker(opts: ToolOptions, cancel: Arc<AtomicBool>, jobs: Receiver<QueuedJob>, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let tools = tools::ensure_tools(&opts, &mut |e| {
+            let _ = tx.send(Msg::Tool(e));
+        })
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::ToolsReady(tools.as_ref().map(|_| ()).map_err(Clone::clone)));
+        for q in jobs {
+            let res = match &tools {
+                Ok(t) => run_job(&q, t, &cancel, &tx),
+                Err(e) => Err(e.clone()),
+            };
+            let _ = tx.send(Msg::Finished(res));
+        }
+    });
+}
+
+fn run_job(q: &QueuedJob, tools: &Tools, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<Outcome, String> {
+    let built = q.spec.build_args(tools.ffmpeg_dir.is_some())?;
+    for w in &built.warnings {
+        let _ = tx.send(Msg::Ev(Event::Warning(w.clone())));
+    }
+    ytdlp::run(&q.job, &built, tools, cancel, |ev| {
+        let _ = tx.send(Msg::Ev(ev));
+    })
+    .map_err(|e| format!("{e:#}"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------------------------
+
+struct Running {
+    title: String,
+    percent: Option<f64>,
+    speed: Option<f64>,
+    eta: Option<u64>,
+    stage: Option<&'static str>,
+    started: Instant,
+    label: String,
+    dest: PathBuf,
+    cancelled: bool,
+}
+
+enum Modal {
+    Format(FormatPicker),
+    Dest(DestPicker),
+}
+
+enum ModalOut {
+    Format(FormatSpec),
+    Dest(String),
+}
+
+impl Modal {
+    fn key(&mut self, k: KeyEvent) -> Step<ModalOut> {
+        match self {
+            Modal::Format(p) => match p.key(k) {
+                Step::Done(s) => Step::Done(ModalOut::Format(s)),
+                Step::Cancel => Step::Cancel,
+                Step::Pending => Step::Pending,
+            },
+            Modal::Dest(p) => match p.key(k) {
+                Step::Done(s) => Step::Done(ModalOut::Dest(s)),
+                Step::Cancel => Step::Cancel,
+                Step::Pending => Step::Pending,
+            },
+        }
+    }
+
+    fn paste(&mut self, s: &str) {
+        match self {
+            Modal::Format(p) => p.paste(s),
+            Modal::Dest(p) => p.paste(s),
+        }
+    }
+
+    fn lines(&self, w: usize) -> Vec<String> {
+        match self {
+            Modal::Format(p) => p.lines(w),
+            Modal::Dest(p) => p.lines(w),
+        }
+    }
+
+    fn cursor(&self, w: usize) -> Option<(u16, u16)> {
+        match self {
+            Modal::Format(p) => p.cursor(w),
+            Modal::Dest(p) => p.cursor(w),
+        }
+    }
+
+    fn error(&mut self, msg: String) {
+        match self {
+            Modal::Format(p) => p.error(msg),
+            Modal::Dest(p) => p.error(msg),
+        }
+    }
+}
+
+struct App {
+    cfg: Config,
+    spec: FormatSpec,
+    dest: PathBuf,
+    composer: LineEditor,
+    history: History,
+    popup_sel: usize,
+    popup_dismissed: bool,
+    modal: Option<Modal>,
+    queue: VecDeque<QueuedJob>,
+    current: Option<Running>,
+    /// Tool download in progress: (name, done, total).
+    tool: Option<(&'static str, u64, Option<u64>)>,
+    tool_header: bool,
+    playlist: Option<String>,
+    job_tx: Sender<QueuedJob>,
+    rx: Receiver<Msg>,
+    cancel: Arc<AtomicBool>,
+    /// Lines waiting to be pushed into the scrollback.
+    scroll: Vec<String>,
+    quit: bool,
+    started: Instant,
+}
+
+impl App {
+    fn new(cfg: Config, opts: ToolOptions) -> Self {
+        let spec = cfg
+            .last_format
+            .as_deref()
+            .and_then(|s| FormatSpec::parse(s).ok())
+            .unwrap_or(FormatSpec::DEFAULT);
+        let dest = cfg.default_dest();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (job_tx, job_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        spawn_worker(opts, cancel.clone(), job_rx, tx);
+        App {
+            cfg,
+            spec,
+            dest,
+            composer: LineEditor::default(),
+            history: History::default(),
+            popup_sel: 0,
+            popup_dismissed: false,
+            modal: None,
+            queue: VecDeque::new(),
+            current: None,
+            tool: None,
+            tool_header: false,
+            playlist: None,
+            job_tx,
+            rx,
+            cancel,
+            scroll: Vec::new(),
+            quit: false,
+            started: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, line: impl Into<String>) {
+        self.scroll.push(line.into());
+    }
+
+    fn fav_name_for(&self, dir: &Path) -> Option<&str> {
+        self.cfg.favorites.iter().find(|f| f.path == dir).map(|f| f.name.as_str())
+    }
+
+    fn print_card(&mut self, width: usize) {
+        let lines = view::card(width, &self.spec, &self.dest, self.fav_name_for(&self.dest));
+        self.scroll.extend(lines);
+    }
+
+    fn save_cfg(&mut self) {
+        if let Err(e) = self.cfg.save() {
+            self.push(warn_line(&format!("cannot save config: {e:#}")));
+        }
+    }
+
+    // ----- main loop ---------------------------------------------------------------------
+
+    fn event_loop(&mut self, term: &mut InlineTerm) -> Result<()> {
+        while !self.quit {
+            while let Ok(msg) = self.rx.try_recv() {
+                self.on_msg(msg, term.width());
+            }
+            let lines = std::mem::take(&mut self.scroll);
+            term.print(&lines)?;
+            let (live, cursor) = self.view(term.width());
+            term.render(&live, cursor)?;
+
+            let animating = self.current.is_some() || self.tool.is_some();
+            let timeout = Duration::from_millis(if animating { 60 } else { 200 });
+            if event::poll(timeout)? {
+                loop {
+                    match event::read()? {
+                        TermEvent::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+                        TermEvent::Paste(s) => self.on_paste(&s),
+                        _ => {}
+                    }
+                    if self.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop a running download (so no yt-dlp is left behind) before the terminal is restored.
+    fn shutdown(&mut self, term: &mut InlineTerm) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.queue.clear();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.current.is_some() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match self.rx.recv_timeout(left) {
+                Ok(Msg::Finished(_)) => self.current = None,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let lines = std::mem::take(&mut self.scroll);
+        let _ = term.print(&lines);
+    }
+
+    // ----- worker messages ---------------------------------------------------------------
+
+    fn on_msg(&mut self, msg: Msg, width: usize) {
+        match msg {
+            Msg::Tool(ev) => match ev {
+                ToolEvent::Found { .. } => {}
+                ToolEvent::Downloading { name, done, total } => {
+                    self.tool_header();
+                    self.tool = Some((name, done, total));
+                }
+                ToolEvent::Installed { name, path } => {
+                    self.tool = None;
+                    self.tool_header();
+                    self.push(detail(&format!("{name}  {}", ui::abbrev_home(&path))));
+                }
+                ToolEvent::Warn(m) => self.push(warn_line(&m)),
+            },
+            Msg::ToolsReady(r) => {
+                self.tool = None;
+                if let Err(e) = r {
+                    self.push(error_line(&format!("tool setup failed: {e}")));
+                }
+            }
+            Msg::Ev(ev) => self.on_download_event(ev, width),
+            Msg::Finished(res) => self.on_finished(res),
+        }
+    }
+
+    fn tool_header(&mut self) {
+        if !self.tool_header {
+            self.tool_header = true;
+            self.push(heading("Setting up tools"));
+        }
+    }
+
+    fn on_download_event(&mut self, ev: Event, width: usize) {
+        let Some(run) = self.current.as_mut() else { return };
+        if run.cancelled {
+            return;
+        }
+        match ev {
+            Event::Info(info) => {
+                run.started = Instant::now();
+                run.percent = None;
+                run.stage = None;
+                run.title = match (info.playlist_index, info.n_entries) {
+                    (Some(i), Some(n)) if n > 1 => format!("[{i}/{n}] {}", info.title),
+                    _ => info.title.clone(),
+                };
+                let lines = oneshot::info_lines(&info, &mut self.playlist);
+                self.scroll.extend(lines);
+            }
+            Event::Progress {
+                percent, speed, eta, ..
+            } => {
+                run.percent = Some(percent);
+                run.speed = speed;
+                run.eta = eta;
+                run.stage = None;
+            }
+            Event::PostProcess(name) => {
+                if let Some(label) = oneshot::stage_label(&name) {
+                    run.stage = Some(label);
+                }
+            }
+            Event::Done { path, size } => {
+                let lines = oneshot::done_lines(&path, size, &run.label, run.started.elapsed().as_secs());
+                run.percent = None;
+                run.stage = None;
+                self.scroll.extend(lines);
+            }
+            Event::AlreadyDownloaded { path } => {
+                run.percent = None;
+                self.scroll.extend(oneshot::already_lines(&path));
+            }
+            Event::Warning(m) => self.scroll.push(warn_line(&truncate(&m, width.saturating_sub(2)))),
+            Event::Error(m) => self.scroll.push(error_line(&m)),
+        }
+    }
+
+    fn on_finished(&mut self, res: Result<Outcome, String>) {
+        let run = self.current.take();
+        self.cancel.store(false, Ordering::SeqCst);
+        let cancelled = run.as_ref().is_some_and(|r| r.cancelled);
+        match res {
+            Ok(o) => {
+                if !cancelled
+                    && !o.cancelled
+                    && (o.success() || !o.saved.is_empty() || !o.already.is_empty())
+                    && let Some(r) = &run
+                {
+                    self.cfg.push_recent(&r.dest);
+                    self.save_cfg();
+                }
+            }
+            Err(e) if !cancelled => self.push(error_line(&e)),
+            Err(_) => {}
+        }
+        if !cancelled {
+            self.push(String::new());
+        }
+        self.pump();
+    }
+
+    // ----- queue -------------------------------------------------------------------------
+
+    fn enqueue(&mut self, url: &str) {
+        let job = Job {
+            url: url.to_string(),
+            dest: self.dest.clone(),
+            template: self.cfg.template.clone().unwrap_or_else(|| DEFAULT_TEMPLATE.to_string()),
+            force: false,
+            playlist: false,
+            cookies_from_browser: None,
+            extra: Vec::new(),
+        };
+        self.queue.push_back(QueuedJob { job, spec: self.spec });
+        self.pump();
+    }
+
+    /// Hand the next queued job to the worker when it is idle.
+    fn pump(&mut self) {
+        if self.current.is_some() {
+            return;
+        }
+        let Some(q) = self.queue.pop_front() else { return };
+        self.current = Some(Running {
+            title: q.job.url.clone(),
+            percent: None,
+            speed: None,
+            eta: None,
+            stage: None,
+            started: Instant::now(),
+            label: q.spec.to_string(),
+            dest: q.job.dest.clone(),
+            cancelled: false,
+        });
+        let _ = self.job_tx.send(q);
+    }
+
+    /// Ctrl+C while downloading: kill the current download and drop the queue.
+    fn cancel_all(&mut self) {
+        self.queue.clear();
+        if let Some(run) = self.current.as_mut()
+            && !run.cancelled
+        {
+            run.cancelled = true;
+            self.cancel.store(true, Ordering::SeqCst);
+            self.scroll.push(heading("Cancelled"));
+            self.scroll.push(String::new());
+        }
+    }
+
+    // ----- input -------------------------------------------------------------------------
+
+    fn popup(&self) -> Vec<&'static command::Cmd> {
+        if self.popup_dismissed || self.modal.is_some() {
+            return Vec::new();
+        }
+        match self.composer.text().strip_prefix('/') {
+            Some(rest) if !rest.contains(char::is_whitespace) => command::matching(rest),
+            _ => Vec::new(),
+        }
+    }
+
+    fn on_paste(&mut self, s: &str) {
+        if let Some(m) = self.modal.as_mut() {
+            m.paste(s);
+            return;
+        }
+        // Several URLs at once: enqueue them all without waiting for Enter.
+        if s.split_whitespace().count() > 1
+            && let Some(urls) = command::extract_urls(s)
+        {
+            for u in urls {
+                self.push(dim(format!("\u{203a} {u}")));
+                self.enqueue(&u);
+            }
+            return;
+        }
+        self.composer.insert_str(s);
+        self.popup_dismissed = false;
+    }
+
+    fn on_key(&mut self, k: KeyEvent) {
+        if let Some(m) = self.modal.as_mut() {
+            match m.key(k) {
+                Step::Pending => {}
+                Step::Cancel => self.modal = None,
+                Step::Done(out) => self.on_modal_done(out),
+            }
+            return;
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let popup = self.popup();
+        if k.code != KeyCode::Esc {
+            self.popup_dismissed = false;
+        }
+        match k.code {
+            KeyCode::Char('c') if ctrl => {
+                if self.current.is_some() {
+                    self.cancel_all();
+                } else if self.composer.is_empty() {
+                    self.quit = true;
+                } else {
+                    self.composer.clear();
+                }
+            }
+            KeyCode::Char('d') if ctrl && self.composer.is_empty() => self.quit = true,
+            KeyCode::Enter => self.submit(),
+            KeyCode::Esc => self.popup_dismissed = true,
+            KeyCode::Tab if !popup.is_empty() => {
+                let c = popup[self.popup_sel.min(popup.len() - 1)];
+                let sp = if c.args.is_empty() { "" } else { " " };
+                self.composer.set(&format!("/{}{sp}", c.name));
+            }
+            KeyCode::Up if !popup.is_empty() => {
+                self.popup_sel = (self.popup_sel + popup.len() - 1) % popup.len();
+            }
+            KeyCode::Down if !popup.is_empty() => self.popup_sel = (self.popup_sel + 1) % popup.len(),
+            KeyCode::Up => {
+                if let Some(t) = self.history.prev(self.composer.text()) {
+                    self.composer.set(&t);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(t) = self.history.next() {
+                    self.composer.set(&t);
+                }
+            }
+            _ => {
+                let before = self.composer.text().len();
+                if self.composer.handle_key(&k) && self.composer.text().len() != before {
+                    self.popup_sel = 0;
+                    self.history.reset();
+                }
+            }
+        }
+    }
+
+    fn submit(&mut self) {
+        let mut text = self.composer.text().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        // Enter on a partial command (`/fo`) completes to the highlighted one.
+        let popup = self.popup();
+        if !popup.is_empty() && command::lookup(&text[1..]).is_none() {
+            text = format!("/{}", popup[self.popup_sel.min(popup.len() - 1)].name);
+        }
+        self.composer.clear();
+        self.popup_sel = 0;
+        self.history.push(&text);
+        match command::parse_input(&text) {
+            Parsed::Empty => {}
+            Parsed::Urls(urls) => {
+                for u in urls {
+                    self.push(dim(format!("\u{203a} {u}")));
+                    self.enqueue(&u);
+                }
+            }
+            Parsed::Command { cmd, args } => {
+                self.push(dim(format!("\u{203a} {text}")));
+                self.run_command(cmd.name, &args);
+            }
+            Parsed::UnknownCommand(w) => {
+                self.push(dim(format!("\u{203a} {text}")));
+                self.push(error_line(&format!("unknown command /{w}")));
+                self.push(detail("type /help for the list of commands"));
+            }
+            Parsed::NotUrl(tok) => {
+                self.push(dim(format!("\u{203a} {text}")));
+                self.push(error_line(&format!("not a URL: {}", truncate(&tok, 40))));
+                self.push(detail("paste a URL, or /help for commands"));
+            }
+        }
+    }
+
+    // ----- commands ----------------------------------------------------------------------
+
+    fn run_command(&mut self, name: &str, args: &str) {
+        match name {
+            "f" if args.is_empty() => self.modal = Some(Modal::Format(FormatPicker::new(&self.spec))),
+            "f" => match FormatSpec::parse(args) {
+                Ok(s) => self.set_format(s),
+                Err(e) => self.push(error_line(&e)),
+            },
+            "o" if args.is_empty() => {
+                self.modal = Some(Modal::Dest(DestPicker::new(&self.cfg, &self.dest)));
+            }
+            "o" => match self.cfg.resolve_dest(args) {
+                Ok(d) => self.set_dest(d),
+                Err(e) => self.push(error_line(&format!("{e:#}"))),
+            },
+            "fav" => self.run_fav(args),
+            "open" => {
+                let dest = self.dest.clone();
+                let _ = std::fs::create_dir_all(&dest);
+                match command::open_folder(&dest) {
+                    Ok(()) => self.push(ok_line(&format!("Opening {}", ui::abbrev_home(&dest)))),
+                    Err(e) => self.push(error_line(&format!("cannot open folder: {e}"))),
+                }
+            }
+            "help" => self.print_help(),
+            "q" => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn run_fav(&mut self, args: &str) {
+        match command::parse_fav(args) {
+            FavArgs::List => {
+                let lines = ui::fav_list_lines(&self.cfg);
+                self.scroll.extend(lines);
+            }
+            FavArgs::Add(name) => match self.cfg.add_favorite(&name, &self.dest.display().to_string()) {
+                Ok(p) => {
+                    self.save_cfg();
+                    self.push(ok_line(&format!("Favorite {name} {}", ui::abbrev_home(&p))));
+                }
+                Err(e) => self.push(error_line(&format!("{e:#}"))),
+            },
+            FavArgs::Rm(name) => {
+                if self.cfg.remove_favorite(&name) {
+                    self.save_cfg();
+                    self.push(ok_line(&format!("Removed favorite {name}")));
+                } else {
+                    self.push(error_line(&format!("no favorite named '{name}'")));
+                }
+            }
+            FavArgs::Bad(msg) => self.push(error_line(msg)),
+        }
+    }
+
+    fn print_help(&mut self) {
+        self.push(heading("Commands"));
+        for c in &command::COMMANDS {
+            let args = if c.args.is_empty() { String::new() } else { format!(" {}", c.args) };
+            self.push(detail(&format!("{}{args}  {}", c.label(), c.help)));
+        }
+        self.push(heading("Keys"));
+        self.push(detail("\u{23ce} download (several URLs may be pasted at once; they queue)"));
+        self.push(detail("\u{2191}\u{2193} history \u{b7} ctrl+u clear \u{b7} ctrl+w delete word"));
+        self.push(detail("ctrl+c cancel download / quit \u{b7} ctrl+d quit"));
+    }
+
+    fn set_format(&mut self, spec: FormatSpec) {
+        self.spec = spec;
+        self.cfg.last_format = Some(spec.canonical());
+        self.save_cfg();
+        self.push(ok_line(&format!("Format {spec}")));
+    }
+
+    fn set_dest(&mut self, dir: PathBuf) {
+        // Drop a trailing slash typed by the user so paths compare equal.
+        let dir: PathBuf = dir.components().collect();
+        self.cfg.last_dest = Some(dir.clone());
+        self.cfg.push_recent(&dir);
+        self.save_cfg();
+        let fav = self.fav_name_for(&dir).map(|n| format!("  \u{2605} {n}")).unwrap_or_default();
+        self.push(ok_line(&format!("Save to {}{fav}", ui::abbrev_home(&dir))));
+        self.dest = dir;
+    }
+
+    fn on_modal_done(&mut self, out: ModalOut) {
+        match out {
+            ModalOut::Format(s) => {
+                self.modal = None;
+                self.set_format(s);
+            }
+            ModalOut::Dest(s) => match self.cfg.resolve_dest(&s) {
+                Ok(d) => {
+                    self.modal = None;
+                    self.set_dest(d);
+                }
+                Err(e) => {
+                    if let Some(m) = self.modal.as_mut() {
+                        m.error(format!("{e:#}"));
+                    }
+                }
+            },
+        }
+    }
+
+    // ----- view --------------------------------------------------------------------------
+
+    fn progress(&self, width: usize) -> Option<String> {
+        let tick = (self.started.elapsed().as_millis() / 100) as usize;
+        if let Some((name, done, total)) = self.tool {
+            let pct = total.filter(|t| *t > 0).map(|t| done as f64 / t as f64 * 100.0);
+            return Some(view::progress_line(
+                &view::Progress {
+                    tick,
+                    title: &format!("Downloading {name}"),
+                    percent: pct,
+                    speed: None,
+                    eta: None,
+                    stage: None,
+                    queued: self.queue.len(),
+                },
+                width,
+            ));
+        }
+        let run = self.current.as_ref()?;
+        if run.cancelled {
+            return Some(format!("  {} {}", ui::spinner_frame(tick), dim("Cancelling\u{2026}")));
+        }
+        Some(view::progress_line(
+            &view::Progress {
+                tick,
+                title: &run.title,
+                percent: run.percent,
+                speed: run.speed,
+                eta: run.eta,
+                stage: run.stage,
+                queued: self.queue.len(),
+            },
+            width,
+        ))
+    }
+
+    fn view(&self, width: usize) -> (Vec<String>, Option<(u16, u16)>) {
+        let mut lines = Vec::new();
+        if let Some(p) = self.progress(width) {
+            lines.push(p);
+        }
+        if let Some(m) = &self.modal {
+            let cursor = m.cursor(width).map(|(x, y)| (x, y + lines.len() as u16));
+            lines.extend(m.lines(width));
+            return (lines, cursor);
+        }
+        let popup = self.popup();
+        if !popup.is_empty() {
+            let shown = &popup[..popup.len().min(6)];
+            lines.extend(view::popup_lines(shown, self.popup_sel.min(shown.len() - 1), width));
+        }
+        let row = lines.len() as u16;
+        let avail = width.saturating_sub(3);
+        let (text, col) = self.composer.window(avail);
+        let prompt = ui::cyan("\u{203a}");
+        if self.composer.is_empty() {
+            lines.push(format!("{prompt} {}", dim("Paste a URL\u{2026}")));
+        } else {
+            lines.push(format!("{prompt} {text}"));
+        }
+        let tail = if self.current.is_some() { "ctrl+c cancel" } else { "ctrl+c quit" };
+        let footer = format!("  \u{23ce} download \u{b7} /f format \u{b7} /o save to \u{b7} /fav \u{b7} {tail}");
+        lines.push(dim(truncate(&footer, width.saturating_sub(1))));
+        (lines, Some((2 + col as u16, row)))
+    }
+}
