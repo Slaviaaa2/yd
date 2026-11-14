@@ -1,0 +1,259 @@
+//! One-shot output renderer: consumes yt-dlp / tool events, prints Codex-style lines.
+
+use std::io::Write;
+use std::time::{Duration, Instant};
+
+use super::*;
+use crate::tools::ToolEvent;
+use crate::ytdlp::{Event, Info};
+
+const REDRAW_EVERY: Duration = Duration::from_millis(100);
+const BAR_WIDTH: usize = 20;
+
+fn flush() {
+    let _ = std::io::stdout().flush();
+}
+
+/// Single live line redrawn in place (TTY only).
+struct Live {
+    shown: bool,
+    last: Option<Instant>,
+    tick: usize,
+}
+
+impl Live {
+    fn new() -> Self {
+        Live {
+            shown: false,
+            last: None,
+            tick: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        if self.shown {
+            print!("\r\x1b[2K");
+            flush();
+            self.shown = false;
+        }
+    }
+
+    /// Draw `line` (already styled); `plain_len` is its display width for truncation safety.
+    fn draw(&mut self, line: &str, force: bool) {
+        if !is_tty() {
+            return;
+        }
+        if !force && self.last.is_some_and(|t| t.elapsed() < REDRAW_EVERY) {
+            return;
+        }
+        self.last = Some(Instant::now());
+        self.tick += 1;
+        print!("\r\x1b[2K{line}");
+        flush();
+        self.shown = true;
+    }
+}
+
+fn stage_label(pp: &str) -> Option<&'static str> {
+    Some(match pp {
+        "ExtractAudio" => "Converting audio",
+        "Merger" => "Merging streams",
+        "VideoConvertor" => "Converting video",
+        "VideoRemuxer" => "Remuxing",
+        "EmbedThumbnail" => "Embedding thumbnail",
+        "FFmpegMetadata" | "Metadata" => "Writing metadata",
+        "FFmpegFixupM4a" | "FixupM4a" | "FixupM3u8" => "Fixing up",
+        "MoveFiles" => return None,
+        _ => "Processing",
+    })
+}
+
+pub struct Printer {
+    format_label: String,
+    live: Live,
+    started: Instant,
+    playlist: Option<String>,
+}
+
+impl Printer {
+    pub fn new(format_label: impl Into<String>) -> Self {
+        Printer {
+            format_label: format_label.into(),
+            live: Live::new(),
+            started: Instant::now(),
+            playlist: None,
+        }
+    }
+
+    pub fn event(&mut self, ev: Event) {
+        match ev {
+            Event::Info(info) => {
+                self.live.clear();
+                self.started = Instant::now();
+                self.print_info(&info);
+                self.live
+                    .draw(&format!("  {} {}", spinner_frame(0), dim("Starting")), true);
+            }
+            Event::Progress {
+                percent, speed, eta, ..
+            } => {
+                let mut parts = Vec::new();
+                if let Some(s) = speed {
+                    parts.push(fmt_speed(s));
+                }
+                if let Some(e) = eta {
+                    parts.push(fmt_duration(e as f64));
+                }
+                let tail = if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", dim(parts.join(" \u{b7} ")))
+                };
+                let line = format!(
+                    "  {} {:>3}% {}{}",
+                    spinner_frame(self.live.tick),
+                    percent as u32,
+                    progress_bar(percent, BAR_WIDTH),
+                    tail
+                );
+                self.live.draw(&line, false);
+            }
+            Event::PostProcess(name) => {
+                if let Some(label) = stage_label(&name) {
+                    let line = format!(
+                        "  {} {}",
+                        spinner_frame(self.live.tick),
+                        dim(format!("{label}\u{2026}"))
+                    );
+                    self.live.draw(&line, true);
+                }
+            }
+            Event::Done { path, size } => {
+                self.live.clear();
+                println!("{}", ok_line(&format!("Saved {}", abbrev_home(&path))));
+                let mut d = Vec::new();
+                if let Some(s) = size {
+                    d.push(fmt_bytes(s));
+                }
+                d.push(self.format_label.clone());
+                d.push(fmt_elapsed(self.started.elapsed().as_secs()));
+                println!("{}", detail(&d.join(" \u{b7} ")));
+                flush();
+            }
+            Event::AlreadyDownloaded { path } => {
+                self.live.clear();
+                println!("{}", ok_line(&format!("Already downloaded {}", abbrev_home(&path))));
+                println!("{}", detail("use --force to download again"));
+                flush();
+            }
+            Event::Warning(msg) => {
+                self.live.clear();
+                println!("{}", warn_line(&truncate(&msg, term_width().saturating_sub(2))));
+                flush();
+            }
+            Event::Error(msg) => {
+                self.live.clear();
+                flush();
+                eprintln!("{}", error_line(&msg));
+            }
+        }
+    }
+
+    /// Clear the live line (call when finishing or on cancel).
+    pub fn finish(&mut self) {
+        self.live.clear();
+    }
+
+    fn print_info(&mut self, info: &Info) {
+        let in_list = info.n_entries.is_some_and(|n| n > 1) && info.playlist_title.is_some();
+        if in_list {
+            let pt = info.playlist_title.clone().unwrap_or_default();
+            if self.playlist.as_deref() != Some(pt.as_str()) {
+                println!("{}", heading(&format!("{pt} ({} items)", info.n_entries.unwrap_or(0))));
+                self.playlist = Some(pt);
+            }
+            let idx = info
+                .playlist_index
+                .map(|i| format!("[{i}/{}] ", info.n_entries.unwrap_or(0)))
+                .unwrap_or_default();
+            println!("  {}{}", dim(idx), info.title);
+        } else {
+            println!("{}", heading(&info.title));
+            let mut d = Vec::new();
+            if let Some(u) = &info.uploader {
+                d.push(u.clone());
+            }
+            if let Some(s) = info.duration {
+                d.push(fmt_duration(s));
+            }
+            if let Some(e) = &info.extractor {
+                d.push(e.clone());
+            }
+            if !d.is_empty() {
+                println!("{}", detail(&d.join(" \u{b7} ")));
+            }
+        }
+        flush();
+    }
+}
+
+/// Renders tool setup events. Quiet unless something is downloaded or goes wrong
+/// (`verbose` also shows tools that were found, used by `yd update`).
+pub struct ToolPrinter {
+    verbose: bool,
+    live: Live,
+    header: bool,
+}
+
+impl ToolPrinter {
+    pub fn new(verbose: bool) -> Self {
+        ToolPrinter {
+            verbose,
+            live: Live::new(),
+            header: false,
+        }
+    }
+
+    fn header(&mut self) {
+        if !self.header {
+            println!("{}", heading("Setting up tools"));
+            self.header = true;
+        }
+    }
+
+    pub fn event(&mut self, ev: ToolEvent) {
+        match ev {
+            ToolEvent::Found { name, path, source } => {
+                if self.verbose {
+                    self.header();
+                    println!("{}", detail(&format!("{name}  {} ({source})", abbrev_home(&path))));
+                }
+            }
+            ToolEvent::Downloading { name, done, total } => {
+                self.header();
+                let pct = total.filter(|t| *t > 0).map(|t| done as f64 / t as f64 * 100.0);
+                let body = match pct {
+                    Some(p) => format!("{:>3}% {}  {}", p as u32, progress_bar(p, BAR_WIDTH), dim(name)),
+                    None => format!("{}  {}", dim(fmt_bytes(done)), dim(name)),
+                };
+                let line = format!("  {} {}", spinner_frame(self.live.tick), body);
+                self.live.draw(&line, false);
+            }
+            ToolEvent::Installed { name, path } => {
+                self.live.clear();
+                self.header();
+                println!("{}", detail(&format!("{name}  {}", abbrev_home(&path))));
+                flush();
+            }
+            ToolEvent::Warn(msg) => {
+                self.live.clear();
+                println!("{}", warn_line(&msg));
+                flush();
+            }
+        }
+    }
+
+    pub fn finish(&mut self) {
+        self.live.clear();
+    }
+}
