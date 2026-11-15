@@ -2,8 +2,11 @@
 name = "yd"
 version = "1.0.0"
 edition = "2024"
-description = "Fast, friendly yt-dlp front-end (CLI + inline TUI)"
+description = "Fast, friendly yt-dlp front-end: one-shot CLI and interactive TUI"
 repository = "https://github.com/Slaviaaa2/yd"
+readme = "README.md"
+keywords = ["yt-dlp", "youtube", "downloader", "cli", "tui"]
+categories = ["command-line-utilities", "multimedia"]
 
 [[bin]]
 name = "yd"

@@ -1,4 +1,4 @@
-//! One-shot output renderer: consumes yt-dlp / tool events, prints Codex-style lines.
+//! One-shot output renderer: consumes yt-dlp / tool events, prints styled status lines.
 
 use std::io::Write;
 use std::time::{Duration, Instant};

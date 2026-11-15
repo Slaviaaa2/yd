@@ -1,4 +1,4 @@
-//! Codex-style selection lists (format and destination pickers) shared by the REPL and `--pick`.
+//! Selection lists (format and destination pickers) shared by the REPL and `--pick`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

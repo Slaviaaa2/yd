@@ -293,7 +293,7 @@ impl History {
         self.recalled = None;
     }
 
-    /// Codex's rule: the composer is empty, or still holds the unedited recalled entry with the
+    /// History-browsing rule: the composer is empty, or still holds the unedited recalled entry with the
     /// cursor at its start or end. Arrows then navigate history (and suggestions stay off).
     pub fn browsing(&self, text: &str, cursor: usize) -> bool {
         text.is_empty() || (self.recalled.as_deref() == Some(text) && (cursor == 0 || cursor == text.len()))

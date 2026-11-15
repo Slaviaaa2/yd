@@ -740,7 +740,7 @@ impl App {
                     self.accept_suggestion(sug);
                 }
             }
-            // Shift+↑↓ always move the candidate; plain ↑↓ follow Codex's rule (see `arrow_action`).
+            // Shift+↑↓ always move the candidate; plain ↑↓ follow the history-vs-suggestion rule (see `arrow_action`).
             KeyCode::Up | KeyCode::Down => {
                 let dir = if k.code == KeyCode::Up { -1 } else { 1 };
                 let action = if shift && sug.is_some() { Arrow::Candidate } else { arrow_action(browsing, sug.is_some()) };
@@ -1057,7 +1057,7 @@ impl App {
 const SUMMARY_MAX_FILES: usize = 20;
 
 impl App {
-    /// Codex-style recap printed to the normal screen after leaving the alternate screen.
+    /// Session recap printed to the normal screen after leaving the alternate screen.
     fn summary_lines(&self) -> Vec<String> {
         if self.saved.is_empty() && self.skipped == 0 && self.failed.is_empty() {
             return Vec::new();

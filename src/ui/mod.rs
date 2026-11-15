@@ -1,4 +1,4 @@
-//! Codex-CLI-like styling helpers shared by the one-shot output and the interactive mode.
+//! Terminal styling helpers shared by the one-shot output and the interactive mode.
 #![allow(dead_code)] // helpers also used by the interactive mode
 
 pub mod ansi;
