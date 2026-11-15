@@ -174,6 +174,25 @@ impl Modal {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Arrow {
+    History,
+    Candidate,
+    Nothing,
+}
+
+/// What ↑/↓ do: history while browsing it (suggestions are off then), else the suggestion list
+/// if one is shown, else nothing (a single-line input has no vertical cursor movement).
+fn arrow_action(browsing: bool, list_visible: bool) -> Arrow {
+    if browsing {
+        Arrow::History
+    } else if list_visible {
+        Arrow::Candidate
+    } else {
+        Arrow::Nothing
+    }
+}
+
 /// Move a list selection by `dir` (+1/-1), wrapping around.
 fn move_sel(sel: usize, n: usize, dir: i32) -> usize {
     (sel.min(n - 1) as i32 + dir).rem_euclid(n as i32) as usize
@@ -266,7 +285,8 @@ struct App {
     composer: LineEditor,
     history: History,
     popup_sel: usize,
-    popup_dismissed: bool,
+    /// Token (start, text) whose suggestions were hidden with Esc.
+    dismissed: Option<(usize, String)>,
     modal: Option<Modal>,
     /// Settings screen waiting while a picker opened from it is active.
     parent: Option<Modal>,
@@ -313,7 +333,7 @@ impl App {
             composer: LineEditor::default(),
             history: History::from_items(initial_history),
             popup_sel: 0,
-            popup_dismissed: false,
+            dismissed: None,
             modal: None,
             parent: None,
             height: 24,
@@ -590,7 +610,15 @@ impl App {
     /// Candidates for the token being typed (only when the cursor is at the end of the line).
     fn suggestions(&self) -> Option<suggest::Suggestions> {
         let text = self.composer.text();
-        if self.popup_dismissed || self.modal.is_some() || text.is_empty() || self.composer.cursor() != text.len() {
+        if self.modal.is_some() || text.is_empty() || self.composer.cursor() != text.len() {
+            return None;
+        }
+        // Browsing history: the arrows belong to history, so no popup and no ghost.
+        if self.history.browsing(text, self.composer.cursor()) {
+            return None;
+        }
+        let start = suggest::token_start(text);
+        if self.dismissed.as_ref().is_some_and(|(s, t)| *s == start && t == &text[start..]) {
             return None;
         }
         let ctx = suggest::Ctx {
@@ -649,7 +677,6 @@ impl App {
             return;
         }
         self.composer.insert_str(s);
-        self.popup_dismissed = false;
     }
 
     fn on_key(&mut self, k: KeyEvent) {
@@ -669,9 +696,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         let sug = self.suggestions();
-        if k.code != KeyCode::Esc {
-            self.popup_dismissed = false;
-        }
+        let browsing = self.history.browsing(self.composer.text(), self.composer.cursor());
         match k.code {
             KeyCode::PageUp => self.scroll.up(self.scroll.page),
             KeyCode::PageDown => self.scroll.down(self.scroll.page),
@@ -701,21 +726,31 @@ impl App {
                 }
                 self.submit();
             }
-            KeyCode::Esc => self.popup_dismissed = true,
+            KeyCode::Esc => {
+                let t = self.composer.text();
+                let start = suggest::token_start(t);
+                self.dismissed = Some((start, t[start..].to_string()));
+            }
             KeyCode::Tab | KeyCode::Right if sug.is_some() && self.composer.cursor() == self.composer.text().len() => {
                 if let Some(sug) = &sug {
                     self.accept_suggestion(sug);
                 }
             }
-            // Shift+↑↓ choose a candidate; plain ↑↓ (and the mouse wheel) stay input history.
-            KeyCode::Up | KeyCode::Down if shift => {
-                if let Some(sug) = &sug {
-                    let dir = if k.code == KeyCode::Up { -1 } else { 1 };
-                    self.popup_sel = move_sel(self.popup_sel, sug.items.len(), dir);
+            // Shift+↑↓ always move the candidate; plain ↑↓ follow Codex's rule (see `arrow_action`).
+            KeyCode::Up | KeyCode::Down => {
+                let dir = if k.code == KeyCode::Up { -1 } else { 1 };
+                let action = if shift { arrow_action(false, sug.is_some()) } else { arrow_action(browsing, sug.is_some()) };
+                match action {
+                    Arrow::History if dir < 0 => self.history_prev(),
+                    Arrow::History => self.history_next(),
+                    Arrow::Candidate => {
+                        if let Some(sug) = &sug {
+                            self.popup_sel = move_sel(self.popup_sel, sug.items.len(), dir);
+                        }
+                    }
+                    Arrow::Nothing => {}
                 }
             }
-            KeyCode::Up => self.history_prev(),
-            KeyCode::Down => self.history_next(),
             _ => {
                 let before = self.composer.text().to_string();
                 if self.composer.handle_key(&k) && self.composer.text() != before {
@@ -864,7 +899,7 @@ impl App {
         }
         self.push(heading("Keys"));
         self.push(detail("\u{23ce} download (several URLs may be pasted at once; they queue)"));
-        self.push(detail("\u{2191}\u{2193} / ctrl+p/n history \u{b7} PgUp/PgDn scroll \u{b7} End follow \u{b7} shift+\u{2191}\u{2193} choose suggestion \u{b7} tab or \u{2192} accept"));
+        self.push(detail("\u{2191}\u{2193} / ctrl+p/n history \u{b7} PgUp/PgDn scroll \u{b7} End follow \u{b7} \u{2191}\u{2193} choose suggestion while typing (shift+\u{2191}\u{2193} always) \u{b7} tab or \u{2192} accept"));
         self.push(detail("ctrl+u clear \u{b7} ctrl+w delete word"));
         self.push(detail("ctrl+c cancel download / quit \u{b7} ctrl+d quit"));
     }
@@ -1004,7 +1039,7 @@ impl App {
         }
         let tail = if self.current.is_some() { "ctrl+c cancel" } else { "ctrl+c quit" };
         let footer = if sug.is_some() {
-            "  shift+\u{2191}\u{2193} choose \u{b7} tab accept \u{b7} \u{23ce} complete / run \u{b7} esc hide".to_string()
+            "  \u{2191}\u{2193} choose \u{b7} tab accept \u{b7} \u{23ce} complete / run \u{b7} esc hide".to_string()
         } else if self.scroll.off > 0 {
             let what = if self.scroll.unseen { "new output" } else { "scrolled" };
             format!("  \u{2193} {what} \u{b7} PgDn / End to follow")
@@ -1076,6 +1111,14 @@ mod tests {
         assert!(ansi::to_line(&l[0]).spans.iter().map(|s| s.content.as_ref()).collect::<String>().contains("25 saved \u{b7} 1 skipped \u{b7} 1 failed"));
         assert_eq!(l.len(), 1 + 20 + 1 + 1);
         assert!(l[21].contains("5 more"));
+    }
+
+    #[test]
+    fn arrow_dispatch() {
+        assert_eq!(arrow_action(true, true), Arrow::History);
+        assert_eq!(arrow_action(true, false), Arrow::History);
+        assert_eq!(arrow_action(false, true), Arrow::Candidate);
+        assert_eq!(arrow_action(false, false), Arrow::Nothing);
     }
 
     #[test]

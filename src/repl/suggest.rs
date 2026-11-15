@@ -36,7 +36,7 @@ fn cand(insert: impl Into<String>, label: impl Into<String>, detail: impl Into<S
     }
 }
 
-fn token_start(text: &str) -> usize {
+pub fn token_start(text: &str) -> usize {
     match text.rfind(char::is_whitespace) {
         Some(i) => i + text[i..].chars().next().map_or(1, char::len_utf8),
         None => 0,

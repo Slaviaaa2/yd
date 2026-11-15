@@ -230,6 +230,8 @@ pub struct History {
     items: Vec<String>,
     idx: Option<usize>,
     draft: String,
+    /// The entry last put into the composer by navigation (None once edited).
+    recalled: Option<String>,
 }
 
 impl History {
@@ -253,22 +255,34 @@ impl History {
             Some(0) => return None,
             Some(i) => self.idx = Some(i - 1),
         }
-        self.idx.map(|i| self.items[i].clone())
+        self.recalled = self.idx.map(|i| self.items[i].clone());
+        self.recalled.clone()
     }
 
     pub fn next(&mut self) -> Option<String> {
         let i = self.idx?;
         if i + 1 < self.items.len() {
             self.idx = Some(i + 1);
-            Some(self.items[i + 1].clone())
+            self.recalled = Some(self.items[i + 1].clone());
+            self.recalled.clone()
         } else {
+            // Past the newest entry the composer is cleared.
             self.idx = None;
-            Some(std::mem::take(&mut self.draft))
+            self.recalled = None;
+            self.draft.clear();
+            Some(String::new())
         }
     }
 
     pub fn reset(&mut self) {
         self.idx = None;
+        self.recalled = None;
+    }
+
+    /// Codex's rule: the composer is empty, or still holds the unedited recalled entry with the
+    /// cursor at its start or end. Arrows then navigate history (and suggestions stay off).
+    pub fn browsing(&self, text: &str, cursor: usize) -> bool {
+        text.is_empty() || (self.recalled.as_deref() == Some(text) && (cursor == 0 || cursor == text.len()))
     }
 
     pub fn from_items(items: Vec<String>) -> Self {
@@ -373,6 +387,19 @@ mod tests {
     }
 
     #[test]
+    fn browsing_predicate() {
+        let mut h = History::from_items(vec!["/f mp3".into(), "/f ogg".into()]);
+        assert!(h.browsing("", 0));
+        assert!(!h.browsing("/f", 2));
+        assert_eq!(h.prev("").as_deref(), Some("/f ogg"));
+        assert!(h.browsing("/f ogg", 6) && h.browsing("/f ogg", 0));
+        assert!(!h.browsing("/f ogg", 3), "cursor in the middle");
+        assert!(!h.browsing("/f ogg2", 7), "edited text");
+        h.reset();
+        assert!(!h.browsing("/f ogg", 6));
+    }
+
+    #[test]
     fn history_trim_and_clear() {
         let mut h = History::from_items((0..10).map(|i| i.to_string()).collect());
         assert_eq!(h.trim_to(3), 7);
@@ -395,7 +422,8 @@ mod tests {
         assert_eq!(h.prev("").as_deref(), Some("one"));
         assert_eq!(h.prev(""), None);
         assert_eq!(h.next().as_deref(), Some("two"));
-        assert_eq!(h.next().as_deref(), Some("draft"));
+        // Past the newest entry the composer is cleared.
+        assert_eq!(h.next().as_deref(), Some(""));
         assert_eq!(h.next(), None);
     }
 }
