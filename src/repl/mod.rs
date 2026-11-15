@@ -174,6 +174,11 @@ impl Modal {
     }
 }
 
+/// Move a list selection by `dir` (+1/-1), wrapping around.
+fn move_sel(sel: usize, n: usize, dir: i32) -> usize {
+    (sel.min(n - 1) as i32 + dir).rem_euclid(n as i32) as usize
+}
+
 const TRANSCRIPT_MAX: usize = 3000;
 
 /// Everything that used to go to scrollback: kept in memory, drawn with wrapping, bottom-anchored.
@@ -670,8 +675,6 @@ impl App {
         match k.code {
             KeyCode::PageUp => self.scroll.up(self.scroll.page),
             KeyCode::PageDown => self.scroll.down(self.scroll.page),
-            KeyCode::Up if shift => self.scroll.up(1),
-            KeyCode::Down if shift => self.scroll.down(1),
             KeyCode::Char('p') if ctrl => self.history_prev(),
             KeyCode::Char('n') if ctrl => self.history_next(),
             KeyCode::End if self.scroll.off > 0 => self.scroll.off = 0,
@@ -704,13 +707,12 @@ impl App {
                     self.accept_suggestion(sug);
                 }
             }
-            KeyCode::Up if sug.is_some() => {
-                let n = sug.as_ref().map_or(1, |s| s.items.len());
-                self.popup_sel = (self.popup_sel.min(n - 1) + n - 1) % n;
-            }
-            KeyCode::Down if sug.is_some() => {
-                let n = sug.as_ref().map_or(1, |s| s.items.len());
-                self.popup_sel = (self.popup_sel.min(n - 1) + 1) % n;
+            // Shift+↑↓ choose a candidate; plain ↑↓ (and the mouse wheel) stay input history.
+            KeyCode::Up | KeyCode::Down if shift => {
+                if let Some(sug) = &sug {
+                    let dir = if k.code == KeyCode::Up { -1 } else { 1 };
+                    self.popup_sel = move_sel(self.popup_sel, sug.items.len(), dir);
+                }
             }
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
@@ -862,7 +864,7 @@ impl App {
         }
         self.push(heading("Keys"));
         self.push(detail("\u{23ce} download (several URLs may be pasted at once; they queue)"));
-        self.push(detail("\u{2191}\u{2193} / ctrl+p/n history \u{b7} PgUp/PgDn scroll \u{b7} End follow \u{b7} tab or \u{2192} accept suggestion"));
+        self.push(detail("\u{2191}\u{2193} / ctrl+p/n history \u{b7} PgUp/PgDn scroll \u{b7} End follow \u{b7} shift+\u{2191}\u{2193} choose suggestion \u{b7} tab or \u{2192} accept"));
         self.push(detail("ctrl+u clear \u{b7} ctrl+w delete word"));
         self.push(detail("ctrl+c cancel download / quit \u{b7} ctrl+d quit"));
     }
@@ -1001,7 +1003,9 @@ impl App {
             lines.push(format!("{prompt} {body}"));
         }
         let tail = if self.current.is_some() { "ctrl+c cancel" } else { "ctrl+c quit" };
-        let footer = if self.scroll.off > 0 {
+        let footer = if sug.is_some() {
+            "  shift+\u{2191}\u{2193} choose \u{b7} tab accept \u{b7} \u{23ce} complete / run \u{b7} esc hide".to_string()
+        } else if self.scroll.off > 0 {
             let what = if self.scroll.unseen { "new output" } else { "scrolled" };
             format!("  \u{2193} {what} \u{b7} PgDn / End to follow")
         } else {
@@ -1072,6 +1076,14 @@ mod tests {
         assert!(ansi::to_line(&l[0]).spans.iter().map(|s| s.content.as_ref()).collect::<String>().contains("25 saved \u{b7} 1 skipped \u{b7} 1 failed"));
         assert_eq!(l.len(), 1 + 20 + 1 + 1);
         assert!(l[21].contains("5 more"));
+    }
+
+    #[test]
+    fn selection_wraps() {
+        assert_eq!(move_sel(0, 3, -1), 2);
+        assert_eq!(move_sel(2, 3, 1), 0);
+        assert_eq!(move_sel(5, 3, 1), 0);
+        assert_eq!(move_sel(0, 1, 1), 0);
     }
 
     #[test]
