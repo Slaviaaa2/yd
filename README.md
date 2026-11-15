@@ -19,8 +19,34 @@ URL を貼るだけで最短でダウンロードできる yt-dlp フロント�
 
 ## インストール
 
+**Linux / macOS**
+
 ```sh
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/Slaviaaa2/yd/master/install.sh | bash
+```
+
+`~/.local/bin/yd` に入ります（`YD_INSTALL_DIR` で変更、`YD_VERSION=v1.0.0` で版指定）。
+
+**Windows（PowerShell 7 / Windows PowerShell）**
+
+```powershell
+irm https://raw.githubusercontent.com/Slaviaaa2/yd/master/install.ps1 | iex
+```
+
+**Windows（cmd）** — pwsh があれば pwsh、無ければ Windows PowerShell で実行します。
+
+```bat
+curl -fsSLo "%TEMP%\yd-install.cmd" https://raw.githubusercontent.com/Slaviaaa2/yd/master/install.cmd && "%TEMP%\yd-install.cmd"
+```
+
+`%LOCALAPPDATA%\Programs\yd\yd.exe` に入り、ユーザーの PATH に追加されます（新しいターミナルから使えます）。
+
+**手動 / ソースから**
+
+[Releases](https://github.com/Slaviaaa2/yd/releases) のアーカイブ（`yd-linux-x64.tar.gz` `yd-linux-arm64.tar.gz` `yd-macos-arm64.tar.gz` `yd-macos-x64.tar.gz` `yd-windows-x64.zip`）を展開して PATH に置くか、
+
+```sh
+cargo install --git https://github.com/Slaviaaa2/yd
 ```
 
 yt-dlp・ffmpeg・deno は自動で用意されます（`~/.local/share/yd/tools` → PATH → 自動ダウンロードの順）。
@@ -115,6 +141,7 @@ URL を含まない行の `/f ogg` などは、これまでどおり設定の変
 | `Shift+↑` / `Shift+↓` | 入力候補リストの選択（いつでも有効） |
 | `Tab` / `→` | 入力候補（薄いゴースト文字・候補リスト）を確定 |
 | `End` | スクロール中は最新へ戻る（そうでなければ行末） |
+| `Ctrl+V` | クリップボードから貼り付け（端末の貼り付け `Ctrl+Shift+V` と同じ扱い。複数 URL はまとめてキューへ） |
 | `Ctrl+U` / `Ctrl+W` | 入力の消去 / 単語削除 |
 
 マウスキャプチャはしないので、テキスト選択・コピーはそのまま使えます。

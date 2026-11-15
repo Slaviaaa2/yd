@@ -32,3 +32,8 @@ URL を貼るだけで最短でダウンロードできる CLI / 対話 TUI（�
 - 設定は `YD_CONFIG_DIR`、ツールは `YD_TOOLS_DIR` で一時ディレクトリへ逃がす（実ユーザーの設定を汚さない）
 - 実 DL テストは短い動画 https://www.youtube.com/watch?v=jNQXAC9IVRw で `/tmp/claude-1000/` 配下へ
 - TUI の確認は pty 経由（python pty / script）。GUI ウィンドウは起動しない
+
+## 配布
+- タグ `v*` を push → `.github/workflows/release.yml` が 5 ターゲットをビルドし draft release に `yd-<os>-<arch>.{tar.gz,zip}`（版番号なし、`latest/download` で固定 URL）を添付。ノートを書いて publish
+- publish で `install-test.yml` が install.sh / install.ps1（pwsh・powershell）/ install.cmd を実機ランナーで検証
+- インストーラ: `install.sh`（curl | bash）、`install.ps1`（irm | iex、PS 5.1 互換）、`install.cmd`（cmd 用、pwsh 優先で install.ps1 を実行）

@@ -1,0 +1,40 @@
+name: Install test
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh (curl | bash)
+        run: |
+          export YD_INSTALL_DIR="$RUNNER_TEMP/bin"
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install.sh" | bash
+          "$YD_INSTALL_DIR/yd" --version
+          "$YD_INSTALL_DIR/yd" --help >/dev/null
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell, cmd]
+    steps:
+      - uses: actions/checkout@v4
+      - name: install via ${{ matrix.shell }}
+        shell: cmd
+        env:
+          YD_INSTALL_DIR: ${{ runner.temp }}\yd-${{ matrix.shell }}
+        run: |
+          if "${{ matrix.shell }}"=="pwsh" pwsh -NoProfile -Command "irm https://raw.githubusercontent.com/%GITHUB_REPOSITORY%/%GITHUB_SHA%/install.ps1 | iex" || exit /b 1
+          if "${{ matrix.shell }}"=="powershell" powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/%GITHUB_REPOSITORY%/%GITHUB_SHA%/install.ps1 | iex" || exit /b 1
+          if "${{ matrix.shell }}"=="cmd" call install.cmd || exit /b 1
+          "%YD_INSTALL_DIR%\yd.exe" --version || exit /b 1

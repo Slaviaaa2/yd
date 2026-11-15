@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --notes "Building..."
+
+  build:
+    needs: create
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-22.04,     name: linux-x64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, name: linux-arm64 }
+          - { target: aarch64-apple-darwin,      os: macos-latest,     name: macos-arm64 }
+          - { target: x86_64-apple-darwin,       os: macos-latest,     name: macos-x64 }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest,   name: windows-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pkg="yd-${{ matrix.name }}"
+          mkdir "$pkg"
+          cp README.md "$pkg/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/yd.exe" "$pkg/"
+            7z a "$pkg.zip" "$pkg" >/dev/null
+            asset="$pkg.zip"
+          else
+            cp "target/${{ matrix.target }}/release/yd" "$pkg/"
+            tar czf "$pkg.tar.gz" "$pkg"
+            asset="$pkg.tar.gz"
+          fi
+          gh release upload "$GITHUB_REF_NAME" "$asset" -R "$GITHUB_REPOSITORY" --clobber
