@@ -3,7 +3,7 @@ name = "yd"
 version = "1.0.0"
 edition = "2024"
 description = "Fast, friendly yt-dlp front-end (CLI + inline TUI)"
-license = "MIT"
+repository = "https://github.com/Slaviaaa2/yd"
 
 [[bin]]
 name = "yd"
@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 ctrlc = "3.5.2"

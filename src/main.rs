@@ -1,4 +1,5 @@
 mod cli;
+mod clipboard;
 mod config;
 mod format;
 mod repl;

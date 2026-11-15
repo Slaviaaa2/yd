@@ -672,7 +672,18 @@ impl App {
         self.composer.insert_str(s);
     }
 
+    /// Ctrl+V: clipboard text takes the same path as a bracketed paste.
+    fn on_clipboard(&mut self, text: Option<String>) {
+        match text {
+            Some(t) => self.on_paste(&t),
+            None => self.push(dim("clipboard unavailable \u{b7} use your terminal's paste (ctrl+shift+v)")),
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Char('v') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.on_clipboard(crate::clipboard::read_text());
+        }
         match self.modal.take() {
             Some(Modal::Fav(st)) => return self.fav_key(st, k),
             Some(Modal::Settings(st)) => return self.settings_key(st, k),
@@ -892,7 +903,7 @@ impl App {
         self.push(heading("Keys"));
         self.push(detail("\u{23ce} download (several URLs may be pasted at once; they queue)"));
         self.push(detail("\u{2191}\u{2193} / ctrl+p/n history \u{b7} PgUp/PgDn scroll \u{b7} End follow \u{b7} \u{2191}\u{2193} choose suggestion while typing (shift+\u{2191}\u{2193} always) \u{b7} tab or \u{2192} accept"));
-        self.push(detail("ctrl+u clear \u{b7} ctrl+w delete word"));
+        self.push(detail("ctrl+v paste \u{b7} ctrl+u clear \u{b7} ctrl+w delete word"));
         self.push(detail("ctrl+c cancel download / quit \u{b7} ctrl+d quit"));
     }
 
@@ -1103,6 +1114,28 @@ mod tests {
         assert!(ansi::to_line(&l[0]).spans.iter().map(|s| s.content.as_ref()).collect::<String>().contains("25 saved \u{b7} 1 skipped \u{b7} 1 failed"));
         assert_eq!(l.len(), 1 + 20 + 1 + 1);
         assert!(l[21].contains("5 more"));
+    }
+
+    #[test]
+    fn clipboard_routes_like_paste() {
+        let mut a = app();
+        a.on_paste("hello\nworld");
+        let mut b = app();
+        b.on_clipboard(Some("hello\nworld".into()));
+        assert_eq!(a.composer.text(), b.composer.text());
+        assert_eq!(b.composer.text(), "hello world");
+        // Into a picker's filter, like a terminal paste.
+        let mut c = app();
+        c.modal = Some(Modal::Format(FormatPicker::new(&FormatSpec::DEFAULT)));
+        c.on_clipboard(Some("flac".into()));
+        match &c.modal {
+            Some(Modal::Format(p)) => assert!(p.lines(80)[0].contains("flac")),
+            _ => panic!("modal lost"),
+        }
+        // Failure path: a hint, no crash.
+        let mut d = app();
+        d.on_clipboard(None);
+        assert!(d.scroll.lines.last().unwrap().contains("clipboard unavailable"));
     }
 
     #[test]
