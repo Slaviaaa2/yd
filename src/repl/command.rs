@@ -10,7 +10,7 @@ pub struct Cmd {
     pub help: &'static str,
 }
 
-pub const COMMANDS: [Cmd; 6] = [
+pub const COMMANDS: [Cmd; 7] = [
     Cmd {
         name: "f",
         aliases: &["format"],
@@ -34,6 +34,12 @@ pub const COMMANDS: [Cmd; 6] = [
         aliases: &[],
         args: "",
         help: "Open the save folder in the file manager",
+    },
+    Cmd {
+        name: "settings",
+        aliases: &["set"],
+        args: "",
+        help: "Open the settings screen",
     },
     Cmd {
         name: "help",
@@ -100,12 +106,12 @@ pub struct Inline {
     pub force: bool,
 }
 
-fn takes_arg(tok: &str) -> bool {
+pub fn takes_arg(tok: &str) -> bool {
     matches!(tok.to_ascii_lowercase().as_str(), "/f" | "/format" | "/o" | "/out")
 }
 
 /// Does the line contain a URL outside of modifier arguments?
-fn has_url(toks: &[&str]) -> bool {
+pub fn has_url(toks: &[&str]) -> bool {
     let mut i = 0;
     while i < toks.len() {
         if takes_arg(toks[i]) {
@@ -312,7 +318,8 @@ mod tests {
     #[test]
     fn command_matching() {
         let names = |p: &str| matching(p).iter().map(|c| c.name).collect::<Vec<_>>();
-        assert_eq!(names(""), ["f", "o", "fav", "open", "help", "q"]);
+        assert_eq!(names(""), ["f", "o", "fav", "open", "settings", "help", "q"]);
+        assert_eq!(names("se"), ["settings"]);
         assert_eq!(names("f"), ["f", "fav"]);
         assert_eq!(names("fo"), ["f"]);
         assert_eq!(names("ex"), ["q"]);

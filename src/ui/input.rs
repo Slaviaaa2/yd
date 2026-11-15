@@ -185,11 +185,12 @@ impl LineEditor {
         self.text[..self.cur].width()
     }
 
-    /// The slice to show in `avail` columns (cursor cell included) and the cursor column within it.
-    pub fn window(&self, avail: usize) -> (String, usize) {
+    /// Byte range of the slice to show in `avail` columns (cursor cell included) and the cursor
+    /// column within it.
+    pub fn window_range(&self, avail: usize) -> (usize, usize, usize) {
         let avail = avail.max(2);
         if self.text.width() < avail {
-            return (self.text.clone(), self.cursor_col());
+            return (0, self.text.len(), self.cursor_col());
         }
         // Keep the cursor visible; leave some text to its right when possible.
         let back_budget = avail * 3 / 4;
@@ -203,17 +204,23 @@ impl LineEditor {
             w += cw;
             start = i;
         }
-        let mut out = String::new();
+        let mut end = start;
         let mut used = 0;
         for c in self.text[start..].chars() {
             let cw = c.width().unwrap_or(0);
             if used + cw > avail - 1 {
                 break;
             }
-            out.push(c);
+            end += c.len_utf8();
             used += cw;
         }
-        (out, self.text[start..self.cur].width())
+        (start, end, self.text[start..self.cur].width())
+    }
+
+    /// The slice to show in `avail` columns and the cursor column within it.
+    pub fn window(&self, avail: usize) -> (String, usize) {
+        let (s, e, col) = self.window_range(avail);
+        (self.text[s..e].to_string(), col)
     }
 }
 
@@ -261,6 +268,30 @@ impl History {
     }
 
     pub fn reset(&mut self) {
+        self.idx = None;
+    }
+
+    pub fn from_items(items: Vec<String>) -> Self {
+        History {
+            items,
+            ..History::default()
+        }
+    }
+
+    pub fn items(&self) -> &[String] {
+        &self.items
+    }
+
+    /// Keep only the newest `n` entries; returns how many were dropped.
+    pub fn trim_to(&mut self, n: usize) -> usize {
+        let drop = self.items.len().saturating_sub(n);
+        self.items.drain(..drop);
+        self.idx = None;
+        drop
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
         self.idx = None;
     }
 }
@@ -339,6 +370,18 @@ mod tests {
         assert!(col <= 10);
         let (s, col) = ed("short").window(20);
         assert_eq!((s.as_str(), col), ("short", 5));
+    }
+
+    #[test]
+    fn history_trim_and_clear() {
+        let mut h = History::from_items((0..10).map(|i| i.to_string()).collect());
+        assert_eq!(h.trim_to(3), 7);
+        assert_eq!(h.items(), ["7", "8", "9"]);
+        assert_eq!(h.trim_to(50), 0);
+        h.push("x");
+        assert_eq!(h.items().len(), 4);
+        h.clear();
+        assert!(h.items().is_empty());
     }
 
     #[test]

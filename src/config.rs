@@ -7,7 +7,38 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-const MAX_RECENT: usize = 10;
+pub const DEFAULT_RECENT_KEEP: usize = 10;
+pub const DEFAULT_HISTORY_KEEP: usize = 500;
+
+/// Interactive-mode settings (`[settings]` in config.toml). Missing keys = defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Settings {
+    pub recent_keep: usize,
+    pub history_persist: bool,
+    pub history_keep: usize,
+    /// Overwrite existing files by default.
+    pub force: bool,
+    /// Download the whole playlist for v=&list= URLs by default.
+    pub playlist: bool,
+    pub cookies: Option<String>,
+    /// Print the session summary after leaving the alternate screen.
+    pub exit_summary: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            recent_keep: DEFAULT_RECENT_KEEP,
+            history_persist: true,
+            history_keep: DEFAULT_HISTORY_KEEP,
+            force: false,
+            playlist: false,
+            cookies: None,
+            exit_summary: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Favorite {
@@ -24,6 +55,7 @@ pub struct Config {
     pub last_format: Option<String>,
     pub last_dest: Option<PathBuf>,
     pub template: Option<String>,
+    pub settings: Settings,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -35,6 +67,33 @@ pub fn config_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
+}
+
+/// Input history file (one entry per line).
+pub fn history_path() -> PathBuf {
+    config_dir().join("history")
+}
+
+/// Read the history file; missing = empty.
+pub fn load_history() -> Vec<String> {
+    std::fs::read_to_string(history_path())
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_history(items: &[String]) -> Result<()> {
+    let path = history_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut text = items.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Expand a leading `~` / `~/`.
@@ -102,12 +161,39 @@ impl Config {
         self.favorites.iter().find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
+    fn check_name(name: &str) -> Result<()> {
+        if name.is_empty() || name.contains(['/', '\\', '~', ':']) || name.starts_with('.') || name.contains(char::is_whitespace) {
+            bail!("invalid favorite name '{name}' (no slashes, colons or spaces, no leading dot)");
+        }
+        Ok(())
+    }
+
+    /// Rename favorite `idx`; fails on an invalid name or one used by another favorite.
+    pub fn rename_favorite(&mut self, idx: usize, new: &str) -> Result<()> {
+        let new = new.trim();
+        Self::check_name(new)?;
+        if self.favorites.iter().enumerate().any(|(i, f)| i != idx && f.name.eq_ignore_ascii_case(new)) {
+            bail!("a favorite named '{new}' already exists");
+        }
+        match self.favorites.get_mut(idx) {
+            Some(f) => f.name = new.to_string(),
+            None => bail!("no favorite f:{idx}"),
+        }
+        Ok(())
+    }
+
+    /// Cheap check used for live highlighting: would `resolve_dest` accept `s` (ignoring the filesystem)?
+    pub fn dest_is_valid(&self, s: &str) -> bool {
+        match self.resolve_index(s) {
+            Some(r) => r.is_ok(),
+            None => self.favorite(s).is_some() || s.contains(['/', '\\']) || s.starts_with(['~', '.']),
+        }
+    }
+
     /// Add (or replace, keeping position) a favorite. `path` is stored absolute.
     pub fn add_favorite(&mut self, name: &str, path: &str) -> Result<PathBuf> {
         let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\', '~', ':']) || name.starts_with('.') {
-            bail!("invalid favorite name '{name}' (no slashes or colons, no leading dot)");
-        }
+        Self::check_name(name)?;
         let path = absolutize(path)?;
         if let Some(f) = self.favorites.iter_mut().find(|f| f.name.eq_ignore_ascii_case(name)) {
             f.name = name.to_string();
@@ -132,7 +218,7 @@ impl Config {
     pub fn push_recent(&mut self, dir: &Path) {
         self.recent.retain(|p| p != dir);
         self.recent.insert(0, dir.to_path_buf());
-        self.recent.truncate(MAX_RECENT);
+        self.recent.truncate(self.settings.recent_keep.max(1));
     }
 
     /// `f:N` / `r:N` (0-based index into favorites / recent as listed). `None` if `s` is not that form.
@@ -224,6 +310,37 @@ mod tests {
         assert!(c.remove_favorite("VID"));
         assert!(!c.remove_favorite("vid"));
         assert!(c.add_favorite("a/b", "/x").is_err());
+    }
+
+    #[test]
+    fn old_config_without_settings() {
+        let old = "last_format = \"mp3\"\nrecent = [\"/a\"]\n[[favorites]]\nname = \"m\"\npath = \"/m\"\n";
+        let c: Config = toml::from_str(old).unwrap();
+        assert_eq!(c.settings, Settings::default());
+        assert_eq!(c.favorites.len(), 1);
+        let c: Config = toml::from_str("[settings]\nrecent_keep = 5\ncookies = \"firefox\"\n").unwrap();
+        assert_eq!(c.settings.recent_keep, 5);
+        assert_eq!(c.settings.cookies.as_deref(), Some("firefox"));
+        assert!(c.settings.history_persist && c.settings.exit_summary);
+        let t = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(toml::from_str::<Config>(&t).unwrap().settings, c.settings);
+    }
+
+    #[test]
+    fn recent_cap_follows_settings_and_rename() {
+        let mut c = Config::default();
+        c.settings.recent_keep = 3;
+        for i in 0..6 {
+            c.push_recent(Path::new(&format!("/d/{i}")));
+        }
+        assert_eq!(c.recent.len(), 3);
+        c.add_favorite("a", "/x").unwrap();
+        c.add_favorite("b", "/y").unwrap();
+        assert!(c.rename_favorite(0, "b").is_err());
+        assert!(c.rename_favorite(0, "bad name").is_err());
+        c.rename_favorite(0, "z").unwrap();
+        assert_eq!(c.favorites[0].name, "z");
+        assert!(c.dest_is_valid("f:1") && !c.dest_is_valid("f:5") && c.dest_is_valid("~/x") && !c.dest_is_valid("nope"));
     }
 
     #[test]

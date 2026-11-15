@@ -270,7 +270,7 @@ pub struct FormatPicker {
     choices: Vec<FormatSpec>,
 }
 
-fn format_detail(spec: &FormatSpec) -> String {
+pub fn format_detail(spec: &FormatSpec) -> String {
     let c = spec.container;
     if c == Container::Original {
         "no conversion".into()
@@ -350,20 +350,10 @@ fn common_prefix(names: &[String]) -> String {
     p
 }
 
-/// Complete the last path component of `input` against directories (`~` is kept as typed).
-pub fn complete_path(input: &str) -> Completion {
-    if input.is_empty() {
-        return Completion {
-            text: "~/".into(),
-            candidates: vec![],
-        };
-    }
-    if input == "~" {
-        return Completion {
-            text: "~/".into(),
-            candidates: vec![],
-        };
-    }
+/// Directory names matching the last path component of `input`, with the directory part as typed
+/// (`~` kept). Dot-directories only when the prefix starts with a dot.
+pub fn dir_names(input: &str) -> (String, Vec<String>) {
+    let input = if input == "~" { "~/" } else { input };
     let (dir_str, prefix) = match input.rfind('/') {
         Some(i) => (&input[..=i], &input[i + 1..]),
         None => ("", input),
@@ -378,6 +368,18 @@ pub fn complete_path(input: &str) -> Completion {
         .filter(|n| n.starts_with(prefix) && (prefix.starts_with('.') || !n.starts_with('.')))
         .collect();
     names.sort();
+    (dir_str.to_string(), names)
+}
+
+/// Complete the last path component of `input` against directories (`~` is kept as typed).
+pub fn complete_path(input: &str) -> Completion {
+    if input.is_empty() || input == "~" {
+        return Completion {
+            text: "~/".into(),
+            candidates: vec![],
+        };
+    }
+    let (dir_str, names) = dir_names(input);
     match names.len() {
         0 => Completion {
             text: input.to_string(),

@@ -2,6 +2,9 @@
 //! (progress, popup, pickers), composer. A short session summary is printed after leaving it.
 
 mod command;
+mod highlight;
+mod modals;
+mod suggest;
 mod view;
 
 use std::collections::VecDeque;
@@ -14,11 +17,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use ratatui::layout::Position;
+use unicode_width::UnicodeWidthStr;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::format::{DEFAULT_TEMPLATE, FormatSpec};
 use crate::tools::{self, ToolEvent, ToolOptions, Tools};
 use crate::ui::input::{History, LineEditor};
@@ -110,6 +114,8 @@ struct Running {
 enum Modal {
     Format(FormatPicker),
     Dest(DestPicker),
+    Fav(modals::FavState),
+    Settings(modals::SettingsState),
 }
 
 enum ModalOut {
@@ -130,6 +136,8 @@ impl Modal {
                 Step::Cancel => Step::Cancel,
                 Step::Pending => Step::Pending,
             },
+            // Handled by the App (they edit the config).
+            Modal::Fav(_) | Modal::Settings(_) => Step::Pending,
         }
     }
 
@@ -137,6 +145,7 @@ impl Modal {
         match self {
             Modal::Format(p) => p.paste(s),
             Modal::Dest(p) => p.paste(s),
+            Modal::Fav(_) | Modal::Settings(_) => {}
         }
     }
 
@@ -144,6 +153,7 @@ impl Modal {
         match self {
             Modal::Format(p) => p.lines(w),
             Modal::Dest(p) => p.lines(w),
+            Modal::Fav(_) | Modal::Settings(_) => Vec::new(),
         }
     }
 
@@ -151,6 +161,7 @@ impl Modal {
         match self {
             Modal::Format(p) => p.cursor(w),
             Modal::Dest(p) => p.cursor(w),
+            Modal::Fav(_) | Modal::Settings(_) => None,
         }
     }
 
@@ -158,6 +169,7 @@ impl Modal {
         match self {
             Modal::Format(p) => p.error(msg),
             Modal::Dest(p) => p.error(msg),
+            Modal::Fav(_) | Modal::Settings(_) => {}
         }
     }
 }
@@ -251,6 +263,10 @@ struct App {
     popup_sel: usize,
     popup_dismissed: bool,
     modal: Option<Modal>,
+    /// Settings screen waiting while a picker opened from it is active.
+    parent: Option<Modal>,
+    /// Terminal height of the last frame.
+    height: usize,
     queue: VecDeque<QueuedJob>,
     current: Option<Running>,
     /// Tool download in progress: (name, done, total).
@@ -278,6 +294,9 @@ impl App {
             .and_then(|s| FormatSpec::parse(s).ok())
             .unwrap_or(FormatSpec::DEFAULT);
         let dest = cfg.default_dest();
+        let mut initial_history = if cfg.settings.history_persist { config::load_history() } else { Vec::new() };
+        let keep = cfg.settings.history_keep;
+        initial_history.drain(..initial_history.len().saturating_sub(keep));
         let cancel = Arc::new(AtomicBool::new(false));
         let (job_tx, job_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
@@ -287,10 +306,12 @@ impl App {
             spec,
             dest,
             composer: LineEditor::default(),
-            history: History::default(),
+            history: History::from_items(initial_history),
             popup_sel: 0,
             popup_dismissed: false,
             modal: None,
+            parent: None,
+            height: 24,
             queue: VecDeque::new(),
             current: None,
             tool: None,
@@ -515,9 +536,9 @@ impl App {
             url: url.to_string(),
             dest,
             template: self.cfg.template.clone().unwrap_or_else(|| DEFAULT_TEMPLATE.to_string()),
-            force,
-            playlist: false,
-            cookies_from_browser: None,
+            force: force || self.cfg.settings.force,
+            playlist: self.cfg.settings.playlist,
+            cookies_from_browser: self.cfg.settings.cookies.clone(),
             extra: Vec::new(),
         };
         self.queue.push_back(QueuedJob { job, spec, note });
@@ -561,13 +582,49 @@ impl App {
 
     // ----- input -------------------------------------------------------------------------
 
-    fn popup(&self) -> Vec<&'static command::Cmd> {
-        if self.popup_dismissed || self.modal.is_some() {
-            return Vec::new();
+    /// Candidates for the token being typed (only when the cursor is at the end of the line).
+    fn suggestions(&self) -> Option<suggest::Suggestions> {
+        let text = self.composer.text();
+        if self.popup_dismissed || self.modal.is_some() || text.is_empty() || self.composer.cursor() != text.len() {
+            return None;
         }
-        match self.composer.text().strip_prefix('/') {
-            Some(rest) if !rest.contains(char::is_whitespace) => command::matching(rest),
-            _ => Vec::new(),
+        let ctx = suggest::Ctx {
+            favorites: &self.cfg.favorites,
+            recent: &self.cfg.recent,
+        };
+        let sug = suggest::suggest(text, &ctx);
+        if sug.items.is_empty() {
+            return None;
+        }
+        let tok = &text[sug.start..];
+        // A single, already complete candidate has nothing left to offer.
+        if sug.items.len() == 1 && suggest::is_complete(tok, &sug.items[0]) {
+            return None;
+        }
+        Some(sug)
+    }
+
+    /// Replace the token being typed by the selected candidate.
+    fn accept_suggestion(&mut self, sug: &suggest::Suggestions) {
+        let c = &sug.items[self.popup_sel.min(sug.items.len() - 1)];
+        let text = format!("{}{}", &self.composer.text()[..sug.start], c.insert);
+        self.composer.set(&text);
+        self.popup_sel = 0;
+    }
+
+    /// Echo of a submitted line, highlighted like the composer (dim).
+    fn echo(&mut self, text: &str) {
+        let segs = highlight::segments(text, &self.cfg);
+        self.push(format!("{} {}", dim("\u{203a}"), highlight::render(&segs, true)));
+    }
+
+    fn persist_history(&mut self) {
+        if self.cfg.settings.history_persist {
+            let keep = self.cfg.settings.history_keep;
+            self.history.trim_to(keep);
+            if let Err(e) = config::save_history(self.history.items()) {
+                self.push(warn_line(&format!("cannot save history: {e:#}")));
+            }
         }
     }
 
@@ -591,35 +648,32 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        match self.modal.take() {
+            Some(Modal::Fav(st)) => return self.fav_key(st, k),
+            Some(Modal::Settings(st)) => return self.settings_key(st, k),
+            other => self.modal = other,
+        }
         if let Some(m) = self.modal.as_mut() {
             match m.key(k) {
                 Step::Pending => {}
-                Step::Cancel => self.modal = None,
+                Step::Cancel => self.modal = self.parent.take(),
                 Step::Done(out) => self.on_modal_done(out),
             }
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let popup = self.popup();
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let sug = self.suggestions();
         if k.code != KeyCode::Esc {
             self.popup_dismissed = false;
         }
-        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
             KeyCode::PageUp => self.scroll.up(self.scroll.page),
             KeyCode::PageDown => self.scroll.down(self.scroll.page),
             KeyCode::Up if shift => self.scroll.up(1),
             KeyCode::Down if shift => self.scroll.down(1),
-            KeyCode::Char('p') if ctrl => {
-                if let Some(t) = self.history.prev(self.composer.text()) {
-                    self.composer.set(&t);
-                }
-            }
-            KeyCode::Char('n') if ctrl => {
-                if let Some(t) = self.history.next() {
-                    self.composer.set(&t);
-                }
-            }
+            KeyCode::Char('p') if ctrl => self.history_prev(),
+            KeyCode::Char('n') if ctrl => self.history_next(),
             KeyCode::End if self.scroll.off > 0 => self.scroll.off = 0,
             KeyCode::Char('c') if ctrl => {
                 if self.current.is_some() {
@@ -631,23 +685,38 @@ impl App {
                 }
             }
             KeyCode::Char('d') if ctrl && self.composer.is_empty() => self.quit = true,
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter => {
+                // Enter completes a partial token first; it submits once the token is complete
+                // (or when the cursor sits after a space: `/o ` opens the picker).
+                if let Some(sug) = &sug {
+                    let tok = &self.composer.text()[sug.start..];
+                    let c = &sug.items[self.popup_sel.min(sug.items.len() - 1)];
+                    if !tok.is_empty() && !suggest::is_complete(tok, c) {
+                        self.accept_suggestion(sug);
+                        return;
+                    }
+                }
+                self.submit();
+            }
             KeyCode::Esc => self.popup_dismissed = true,
-            KeyCode::Tab if !popup.is_empty() => {
-                let c = popup[self.popup_sel.min(popup.len() - 1)];
-                let sp = if c.args.is_empty() { "" } else { " " };
-                self.composer.set(&format!("/{}{sp}", c.name));
+            KeyCode::Tab | KeyCode::Right if sug.is_some() && self.composer.cursor() == self.composer.text().len() => {
+                if let Some(sug) = &sug {
+                    self.accept_suggestion(sug);
+                }
             }
-            KeyCode::Up if !popup.is_empty() => {
-                self.popup_sel = (self.popup_sel + popup.len() - 1) % popup.len();
+            KeyCode::Up if sug.is_some() => {
+                let n = sug.as_ref().map_or(1, |s| s.items.len());
+                self.popup_sel = (self.popup_sel.min(n - 1) + n - 1) % n;
             }
-            KeyCode::Down if !popup.is_empty() => self.popup_sel = (self.popup_sel + 1) % popup.len(),
-            // Mouse wheels arrive as arrow keys on the alternate screen: scroll the document.
-            KeyCode::Up => self.scroll.up(3),
-            KeyCode::Down => self.scroll.down(3),
+            KeyCode::Down if sug.is_some() => {
+                let n = sug.as_ref().map_or(1, |s| s.items.len());
+                self.popup_sel = (self.popup_sel.min(n - 1) + 1) % n;
+            }
+            KeyCode::Up => self.history_prev(),
+            KeyCode::Down => self.history_next(),
             _ => {
-                let before = self.composer.text().len();
-                if self.composer.handle_key(&k) && self.composer.text().len() != before {
+                let before = self.composer.text().to_string();
+                if self.composer.handle_key(&k) && self.composer.text() != before {
                     self.popup_sel = 0;
                     self.history.reset();
                 }
@@ -655,19 +724,27 @@ impl App {
         }
     }
 
+    fn history_prev(&mut self) {
+        if let Some(t) = self.history.prev(self.composer.text()) {
+            self.composer.set(&t);
+        }
+    }
+
+    fn history_next(&mut self) {
+        if let Some(t) = self.history.next() {
+            self.composer.set(&t);
+        }
+    }
+
     fn submit(&mut self) {
-        let mut text = self.composer.text().trim().to_string();
+        let text = self.composer.text().trim().to_string();
         if text.is_empty() {
             return;
-        }
-        // Enter on a partial command (`/fo`) completes to the highlighted one.
-        let popup = self.popup();
-        if !popup.is_empty() && command::lookup(&text[1..]).is_none() {
-            text = format!("/{}", popup[self.popup_sel.min(popup.len() - 1)].name);
         }
         self.composer.clear();
         self.popup_sel = 0;
         self.history.push(&text);
+        self.persist_history();
         match command::parse_input(&text) {
             Parsed::Empty => {}
             Parsed::Urls(urls) => {
@@ -677,25 +754,25 @@ impl App {
                 }
             }
             Parsed::Inline(Err(msg)) => {
-                self.push(dim(format!("\u{203a} {text}")));
+                self.echo(&text);
                 self.push(error_line(&msg));
                 self.push(detail("usage: URL... [/f format] [/o folder] [/force]"));
             }
             Parsed::Inline(Ok(inl)) => {
-                self.push(dim(format!("\u{203a} {text}")));
+                self.echo(&text);
                 self.enqueue_inline(inl);
             }
             Parsed::Command { cmd, args } => {
-                self.push(dim(format!("\u{203a} {text}")));
+                self.echo(&text);
                 self.run_command(cmd.name, &args);
             }
             Parsed::UnknownCommand(w) => {
-                self.push(dim(format!("\u{203a} {text}")));
+                self.echo(&text);
                 self.push(error_line(&format!("unknown command /{w}")));
                 self.push(detail("type /help for the list of commands"));
             }
             Parsed::NotUrl(tok) => {
-                self.push(dim(format!("\u{203a} {text}")));
+                self.echo(&text);
                 self.push(error_line(&format!("not a URL: {}", truncate(&tok, 40))));
                 self.push(detail("paste a URL, or /help for commands"));
             }
@@ -735,7 +812,9 @@ impl App {
                 Ok(d) => self.set_dest(d),
                 Err(e) => self.push(error_line(&format!("{e:#}"))),
             },
+            "fav" if args.is_empty() => self.open_fav(),
             "fav" => self.run_fav(args),
+            "settings" => self.open_settings(),
             "open" => {
                 let dest = self.dest.clone();
                 let _ = std::fs::create_dir_all(&dest);
@@ -783,7 +862,8 @@ impl App {
         }
         self.push(heading("Keys"));
         self.push(detail("\u{23ce} download (several URLs may be pasted at once; they queue)"));
-        self.push(detail("ctrl+p/n history \u{b7} \u{2191}\u{2193} PgUp/PgDn scroll \u{b7} ctrl+u clear \u{b7} ctrl+w delete word"));
+        self.push(detail("\u{2191}\u{2193} / ctrl+p/n history \u{b7} PgUp/PgDn scroll \u{b7} End follow \u{b7} tab or \u{2192} accept suggestion"));
+        self.push(detail("ctrl+u clear \u{b7} ctrl+w delete word"));
         self.push(detail("ctrl+c cancel download / quit \u{b7} ctrl+d quit"));
     }
 
@@ -794,26 +874,32 @@ impl App {
         self.push(ok_line(&format!("Format {spec}")));
     }
 
-    fn set_dest(&mut self, dir: PathBuf) {
+    /// Make `dir` the persistent save folder (no transcript output).
+    fn apply_dest(&mut self, dir: PathBuf) -> PathBuf {
         // Drop a trailing slash typed by the user so paths compare equal.
         let dir: PathBuf = dir.components().collect();
         self.cfg.last_dest = Some(dir.clone());
         self.cfg.push_recent(&dir);
         self.save_cfg();
+        self.dest = dir.clone();
+        dir
+    }
+
+    fn set_dest(&mut self, dir: PathBuf) {
+        let dir = self.apply_dest(dir);
         let fav = self.fav_name_for(&dir).map(|n| format!("  \u{2605} {n}")).unwrap_or_default();
         self.push(ok_line(&format!("Save to {}{fav}", ui::abbrev_home(&dir))));
-        self.dest = dir;
     }
 
     fn on_modal_done(&mut self, out: ModalOut) {
         match out {
             ModalOut::Format(s) => {
-                self.modal = None;
+                self.modal = self.parent.take();
                 self.set_format(s);
             }
             ModalOut::Dest(s) => match self.cfg.resolve_dest(&s) {
                 Ok(d) => {
-                    self.modal = None;
+                    self.modal = self.parent.take();
                     self.set_dest(d);
                 }
                 Err(e) => {
@@ -867,6 +953,7 @@ impl App {
     fn draw(&mut self, f: &mut ratatui::Frame) {
         let area = f.area();
         let (w, h) = (area.width as usize, area.height as usize);
+        self.height = h;
         let (live, cursor) = self.view(w);
         let live: Vec<Line> = live.iter().map(|l| ansi::to_line(l)).collect();
         let (rows, cur) = self.scroll.visible(w, h, live, cursor);
@@ -882,30 +969,43 @@ impl App {
             lines.push(p);
         }
         if let Some(m) = &self.modal {
-            let cursor = m.cursor(width).map(|(x, y)| (x, y + lines.len() as u16));
-            lines.extend(m.lines(width));
+            let (body, cur) = match m {
+                Modal::Fav(st) => self.fav_lines(st, width),
+                Modal::Settings(st) => self.settings_lines(st, width),
+                other => (other.lines(width), other.cursor(width)),
+            };
+            let cursor = cur.map(|(x, y)| (x, y + lines.len() as u16));
+            lines.extend(body);
             return (lines, cursor);
         }
-        let popup = self.popup();
-        if !popup.is_empty() {
-            let shown = &popup[..popup.len().min(6)];
-            lines.extend(view::popup_lines(shown, self.popup_sel.min(shown.len() - 1), width));
+        let sug = self.suggestions();
+        if let Some(sug) = &sug {
+            lines.extend(view::suggest_lines(&sug.items, self.popup_sel.min(sug.items.len() - 1), width));
         }
         let row = lines.len() as u16;
         let avail = width.saturating_sub(3);
-        let (text, col) = self.composer.window(avail);
+        let (start, end, col) = self.composer.window_range(avail);
         let prompt = ui::cyan("\u{203a}");
         if self.composer.is_empty() {
             lines.push(format!("{prompt} {}", dim("Paste a URL\u{2026}")));
         } else {
-            lines.push(format!("{prompt} {text}"));
+            let segs = highlight::segments(self.composer.text(), &self.cfg);
+            let mut body = highlight::render(&highlight::clip(&segs, start, end), false);
+            if let Some(sug) = &sug {
+                let ghost = suggest::ghost(self.composer.text(), sug, self.popup_sel.min(sug.items.len() - 1));
+                let shown_w = self.composer.text()[start..end].width();
+                if end == self.composer.text().len() && shown_w + ghost.width() < avail {
+                    body.push_str(&dim(ghost));
+                }
+            }
+            lines.push(format!("{prompt} {body}"));
         }
         let tail = if self.current.is_some() { "ctrl+c cancel" } else { "ctrl+c quit" };
         let footer = if self.scroll.off > 0 {
             let what = if self.scroll.unseen { "new output" } else { "scrolled" };
             format!("  \u{2193} {what} \u{b7} PgDn / End to follow")
         } else {
-            format!("  \u{23ce} download \u{b7} /f format \u{b7} /o save to \u{b7} /fav \u{b7} {tail}")
+            format!("  \u{23ce} download \u{b7} \u{2191} history \u{b7} /f format \u{b7} /o save to \u{b7} /fav \u{b7} /settings \u{b7} {tail}")
         };
         lines.push(dim(truncate(&footer, width.saturating_sub(1))));
         (lines, Some((2 + col as u16, row)))
@@ -944,6 +1044,9 @@ impl App {
     }
 
     fn print_summary(&self) {
+        if !self.cfg.settings.exit_summary {
+            return;
+        }
         for l in self.summary_lines() {
             println!("{l}");
         }

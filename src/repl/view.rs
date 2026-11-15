@@ -4,11 +4,12 @@ use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 
-use super::command::Cmd;
+use super::suggest::Cand;
 use crate::format::FormatSpec;
 use crate::ui::{self, ansi, bold, cyan, dim, progress_bar, spinner_frame, truncate, yellow};
 
 const CARD_WIDTH: usize = 49;
+const MAX_SUGGEST_ROWS: usize = 6;
 
 /// Startup card + hint line.
 pub fn card(width: usize, spec: &FormatSpec, dest: &Path, fav: Option<&str>) -> Vec<String> {
@@ -123,16 +124,20 @@ pub fn progress_line(p: &Progress, width: usize) -> String {
     line
 }
 
-/// Rows of the slash-command popup (selected row highlighted).
-pub fn popup_lines(cmds: &[&Cmd], sel: usize, width: usize) -> Vec<String> {
-    let label_w = cmds.iter().map(|c| c.label().width()).max().unwrap_or(0);
-    cmds.iter()
+/// Rows of the suggestion list (selected row highlighted), at most `MAX_SUGGEST_ROWS` around the selection.
+pub fn suggest_lines(items: &[Cand], sel: usize, width: usize) -> Vec<String> {
+    let rows = items.len().min(MAX_SUGGEST_ROWS);
+    let top = if sel < rows { 0 } else { sel + 1 - rows };
+    let shown = &items[top..top + rows];
+    let label_w = shown.iter().map(|c| c.label.width()).max().unwrap_or(0).min(width.saturating_sub(12).max(8));
+    shown
+        .iter()
         .enumerate()
         .map(|(i, c)| {
-            let label = c.label();
-            let pad = " ".repeat(label_w - label.width());
-            let rest = truncate(c.help, width.saturating_sub(label_w + 6));
-            if i == sel {
+            let label = truncate(&c.label, label_w);
+            let pad = " ".repeat(label_w.saturating_sub(label.width()));
+            let rest = truncate(&c.detail, width.saturating_sub(label_w + 6));
+            if top + i == sel {
                 format!("  {}{pad}  {}", cyan(&label), cyan(&rest))
             } else {
                 dim(format!("  {label}{pad}  {rest}"))
