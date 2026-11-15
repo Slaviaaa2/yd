@@ -28,6 +28,16 @@ impl LineEditor {
         self.cur = self.text.len();
     }
 
+    /// Replace the text and put the cursor at byte `cur` (clamped to a char boundary).
+    pub fn set_with_cursor(&mut self, s: &str, cur: usize) {
+        self.text = s.to_string();
+        let mut c = cur.min(self.text.len());
+        while !self.text.is_char_boundary(c) {
+            c -= 1;
+        }
+        self.cur = c;
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cur = 0;
@@ -230,6 +240,7 @@ pub struct History {
     items: Vec<String>,
     idx: Option<usize>,
     draft: String,
+    draft_cursor: usize,
     /// The entry last put into the composer by navigation (None once edited).
     recalled: Option<String>,
 }
@@ -243,13 +254,15 @@ impl History {
         self.idx = None;
     }
 
-    pub fn prev(&mut self, current: &str) -> Option<String> {
+    /// Older entry. The first step away from the live text saves it (and the cursor) as the draft.
+    pub fn prev(&mut self, current: &str, cursor: usize) -> Option<String> {
         match self.idx {
             None => {
                 if self.items.is_empty() {
                     return None;
                 }
                 self.draft = current.to_string();
+                self.draft_cursor = cursor;
                 self.idx = Some(self.items.len() - 1);
             }
             Some(0) => return None,
@@ -259,18 +272,19 @@ impl History {
         self.recalled.clone()
     }
 
-    pub fn next(&mut self) -> Option<String> {
+    /// Newer entry as (text, cursor); past the newest entry the saved draft comes back exactly.
+    pub fn next(&mut self) -> Option<(String, usize)> {
         let i = self.idx?;
         if i + 1 < self.items.len() {
             self.idx = Some(i + 1);
             self.recalled = Some(self.items[i + 1].clone());
-            self.recalled.clone()
+            let t = self.items[i + 1].clone();
+            let n = t.len();
+            Some((t, n))
         } else {
-            // Past the newest entry the composer is cleared.
             self.idx = None;
             self.recalled = None;
-            self.draft.clear();
-            Some(String::new())
+            Some((std::mem::take(&mut self.draft), std::mem::take(&mut self.draft_cursor)))
         }
     }
 
@@ -391,7 +405,7 @@ mod tests {
         let mut h = History::from_items(vec!["/f mp3".into(), "/f ogg".into()]);
         assert!(h.browsing("", 0));
         assert!(!h.browsing("/f", 2));
-        assert_eq!(h.prev("").as_deref(), Some("/f ogg"));
+        assert_eq!(h.prev("", 0).as_deref(), Some("/f ogg"));
         assert!(h.browsing("/f ogg", 6) && h.browsing("/f ogg", 0));
         assert!(!h.browsing("/f ogg", 3), "cursor in the middle");
         assert!(!h.browsing("/f ogg2", 7), "edited text");
@@ -414,16 +428,24 @@ mod tests {
     #[test]
     fn history_navigation() {
         let mut h = History::default();
-        assert_eq!(h.prev("x"), None);
+        assert_eq!(h.prev("x", 1), None);
         h.push("one");
         h.push("two");
         h.push("two");
-        assert_eq!(h.prev("draft").as_deref(), Some("two"));
-        assert_eq!(h.prev("").as_deref(), Some("one"));
-        assert_eq!(h.prev(""), None);
-        assert_eq!(h.next().as_deref(), Some("two"));
-        // Past the newest entry the composer is cleared.
-        assert_eq!(h.next().as_deref(), Some(""));
+        assert_eq!(h.prev("draft", 2).as_deref(), Some("two"));
+        assert_eq!(h.prev("", 0).as_deref(), Some("one"));
+        assert_eq!(h.prev("", 0), None);
+        assert_eq!(h.next(), Some(("two".to_string(), 3)));
+        // Past the newest entry the draft (text and cursor) comes back exactly.
+        assert_eq!(h.next(), Some(("draft".to_string(), 2)));
         assert_eq!(h.next(), None);
+        // Started from an empty composer: back to empty.
+        assert_eq!(h.prev("", 0).as_deref(), Some("two"));
+        assert_eq!(h.next(), Some((String::new(), 0)));
+        // Editing resets: the edited text becomes the next draft.
+        h.prev("", 0);
+        h.reset();
+        assert_eq!(h.prev("two!", 4).as_deref(), Some("two"));
+        assert_eq!(h.next(), Some(("two!".to_string(), 4)));
     }
 }

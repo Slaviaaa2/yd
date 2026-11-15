@@ -178,19 +178,12 @@ impl Modal {
 enum Arrow {
     History,
     Candidate,
-    Nothing,
 }
 
-/// What ↑/↓ do: history while browsing it (suggestions are off then), else the suggestion list
-/// if one is shown, else nothing (a single-line input has no vertical cursor movement).
+/// What ↑/↓ do: the suggestion list only when it is shown and we are not browsing history;
+/// in every other case plain chronological history.
 fn arrow_action(browsing: bool, list_visible: bool) -> Arrow {
-    if browsing {
-        Arrow::History
-    } else if list_visible {
-        Arrow::Candidate
-    } else {
-        Arrow::Nothing
-    }
+    if list_visible && !browsing { Arrow::Candidate } else { Arrow::History }
 }
 
 /// Move a list selection by `dir` (+1/-1), wrapping around.
@@ -739,7 +732,7 @@ impl App {
             // Shift+↑↓ always move the candidate; plain ↑↓ follow Codex's rule (see `arrow_action`).
             KeyCode::Up | KeyCode::Down => {
                 let dir = if k.code == KeyCode::Up { -1 } else { 1 };
-                let action = if shift { arrow_action(false, sug.is_some()) } else { arrow_action(browsing, sug.is_some()) };
+                let action = if shift && sug.is_some() { Arrow::Candidate } else { arrow_action(browsing, sug.is_some()) };
                 match action {
                     Arrow::History if dir < 0 => self.history_prev(),
                     Arrow::History => self.history_next(),
@@ -748,7 +741,6 @@ impl App {
                             self.popup_sel = move_sel(self.popup_sel, sug.items.len(), dir);
                         }
                     }
-                    Arrow::Nothing => {}
                 }
             }
             _ => {
@@ -762,14 +754,14 @@ impl App {
     }
 
     fn history_prev(&mut self) {
-        if let Some(t) = self.history.prev(self.composer.text()) {
+        if let Some(t) = self.history.prev(self.composer.text(), self.composer.cursor()) {
             self.composer.set(&t);
         }
     }
 
     fn history_next(&mut self) {
-        if let Some(t) = self.history.next() {
-            self.composer.set(&t);
+        if let Some((t, cur)) = self.history.next() {
+            self.composer.set_with_cursor(&t, cur);
         }
     }
 
@@ -1118,7 +1110,7 @@ mod tests {
         assert_eq!(arrow_action(true, true), Arrow::History);
         assert_eq!(arrow_action(true, false), Arrow::History);
         assert_eq!(arrow_action(false, true), Arrow::Candidate);
-        assert_eq!(arrow_action(false, false), Arrow::Nothing);
+        assert_eq!(arrow_action(false, false), Arrow::History);
     }
 
     #[test]
