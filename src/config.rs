@@ -306,7 +306,7 @@ mod tests {
         c.add_favorite("vid", "/b").unwrap();
         c.add_favorite("Music", "/c").unwrap();
         assert_eq!(c.favorites.len(), 2);
-        assert_eq!(c.favorites[0].path, Path::new("/c"));
+        assert_eq!(c.favorites[0].path, absolutize("/c").unwrap());
         assert!(c.remove_favorite("VID"));
         assert!(!c.remove_favorite("vid"));
         assert!(c.add_favorite("a/b", "/x").is_err());
