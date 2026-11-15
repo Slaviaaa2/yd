@@ -4,6 +4,7 @@
 # Env:
 #   YD_INSTALL_DIR  install directory (default: ~/.local/bin)
 #   YD_VERSION      release tag, e.g. v1.0.0 (default: latest)
+#   YD_MENU         yes / no: add an application menu entry (Linux) without asking
 set -euo pipefail
 
 repo="Slaviaaa2/yd"
@@ -45,6 +46,42 @@ mkdir -p "$dir"
 install -m 755 "$bin" "$dir/yd"
 printf '\033[32m✔\033[0m Installed %s\n' "$dir/yd"
 "$dir/yd" --version 2>/dev/null | sed 's/^/  └ /' || true
+
+# Application menu entry (Linux desktop). `curl | bash` has the script on stdin,
+# so the question is read from /dev/tty; without a terminal it is skipped unless YD_MENU=yes.
+add_menu_entry() {
+  local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local file="$apps/yd.desktop"
+  mkdir -p "$apps"
+  cat >"$file" <<EOF
+[Desktop Entry]
+Type=Application
+Name=yd
+GenericName=Video & Audio Downloader
+Comment=Fast yt-dlp front-end: paste a URL to download video or audio
+Exec="$dir/yd"
+Icon=folder-download
+Terminal=true
+Categories=Network;FileTransfer;
+Keywords=youtube;yt-dlp;download;video;audio;mp3;
+EOF
+  command -v update-desktop-database >/dev/null && update-desktop-database "$apps" 2>/dev/null || true
+  printf '\033[32m✔\033[0m Added to the application menu\n  └ %s\n' "$file"
+}
+
+if [ "$os" = linux ]; then
+  menu="${YD_MENU:-}"
+  if [ -z "$menu" ]; then
+    if [ -r /dev/tty ] && { : </dev/tty; } 2>/dev/null; then
+      printf 'Add yd to the application menu? [Y/n] ' >/dev/tty
+      read -r answer </dev/tty || answer=""
+      case "$answer" in [nN]*) menu=no ;; *) menu=yes ;; esac
+    else
+      menu=no
+    fi
+  fi
+  case "$menu" in [yY]*|1|true) add_menu_entry ;; esac
+fi
 
 case ":$PATH:" in
   *":$dir:"*) ;;

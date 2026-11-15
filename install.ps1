@@ -4,6 +4,7 @@
 # Env:
 #   YD_INSTALL_DIR  install directory (default: %LOCALAPPDATA%\Programs\yd)
 #   YD_VERSION      release tag, e.g. v1.0.0 (default: latest)
+#   YD_MENU         yes / no: add a Start menu shortcut without asking
 #
 # Wrapped in a script block so `irm | iex` never leaks variables or calls `exit`
 # on the caller's shell; failures `throw` (exit code 1 under -Command).
@@ -69,6 +70,32 @@
         Write-Host "  - Added $dir to your user PATH. Open a new terminal to use 'yd'."
     }
     if (-not (($env:Path -split ';') -contains $dir)) { $env:Path = "$env:Path;$dir" }
+
+    # Start menu shortcut. Ask only when someone can answer; otherwise follow YD_MENU (default: skip).
+    $menu = $env:YD_MENU
+    if (-not $menu) {
+        $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+        if ($interactive) {
+            $answer = Read-Host 'Add yd to the Start menu? [Y/n]'
+            $menu = if ($answer -match '^[nN]') { 'no' } else { 'yes' }
+        } else {
+            $menu = 'no'
+        }
+    }
+    if ($menu -match '^(y|yes|1|true)$') {
+        $programs = [Environment]::GetFolderPath('Programs')  # %APPDATA%\Microsoft\Windows\Start Menu\Programs
+        $lnk = Join-Path $programs 'yd.lnk'
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($lnk)
+        $shortcut.TargetPath = $target
+        $shortcut.WorkingDirectory = $env:USERPROFILE
+        $shortcut.Description = 'Fast yt-dlp front-end: paste a URL to download video or audio'
+        $shortcut.IconLocation = "$target,0"
+        $shortcut.Save()
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+        Write-Host "OK Added to the Start menu" -ForegroundColor Green
+        Write-Host "  - $lnk"
+    }
 
     try { & $target --version } catch {}
 }

@@ -26,6 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/Slaviaaa2/yd/master/install.sh | ba
 ```
 
 `~/.local/bin/yd` に入ります（`YD_INSTALL_DIR` で変更、`YD_VERSION=v1.0.0` で版指定）。
+Linux ではアプリケーションメニューへの登録を `[Y/n]` で聞きます（`~/.local/share/applications/yd.desktop`。`YD_MENU=yes|no` で質問を省略）。
 
 **Windows（PowerShell 7 / Windows PowerShell）**
 
@@ -40,6 +41,7 @@ curl -fsSLo "%TEMP%\yd-install.cmd" https://raw.githubusercontent.com/Slaviaaa2/
 ```
 
 `%LOCALAPPDATA%\Programs\yd\yd.exe` に入り、ユーザーの PATH に追加されます（新しいターミナルから使えます）。
+スタートメニューへの登録を `[Y/n]` で聞きます（`YD_MENU=yes|no` で質問を省略）。
 
 **手動 / ソースから**
 
