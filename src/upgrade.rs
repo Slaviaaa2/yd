@@ -39,12 +39,45 @@ pub struct Upgrade {
     binary: String,
 }
 
+pub struct InstalledUpgrade {
+    exe: PathBuf,
+    version: Version,
+}
+
+impl InstalledUpgrade {
+    pub fn message(&self) -> String {
+        format!("Upgraded yd to v{}.", self.version)
+    }
+
+    /// Use the path resolved before replacement. On Linux the old running image is now deleted.
+    pub fn restart(self) -> Result<u8> {
+        let mut command = std::process::Command::new(&self.exe);
+        command.args(std::env::args_os().skip(1));
+        let result: io::Result<u8>;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            result = Err(command.exec());
+        }
+        #[cfg(not(unix))]
+        {
+            result = command.status().map(|status| {
+                status
+                    .code()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .unwrap_or(2)
+            });
+        }
+        result.with_context(|| format!("cannot restart {}", self.exe.display()))
+    }
+}
+
 impl Upgrade {
     pub fn question(&self) -> String {
         format!("yd v{} is available. Upgrade?", self.version)
     }
 
-    pub fn install(&self, mut report: impl FnMut(ToolEvent)) -> Result<String> {
+    pub fn install(&self, mut report: impl FnMut(ToolEvent)) -> Result<InstalledUpgrade> {
         let exe = executable_path()?;
         let parent = exe
             .parent()
@@ -89,10 +122,10 @@ impl Upgrade {
         let staged = stage.path().join(&self.binary);
         OpenOptions::new().write(true).open(&staged)?.sync_all()?;
         replace(&staged, &exe).with_context(|| format!("cannot replace {}", exe.display()))?;
-        Ok(format!(
-            "Upgraded yd to v{}. The new version runs on next launch.",
-            self.version
-        ))
+        Ok(InstalledUpgrade {
+            exe,
+            version: self.version.clone(),
+        })
     }
 }
 

@@ -31,7 +31,7 @@ use crate::ui::input::{History, LineEditor};
 use crate::ui::picker::{DestChoice, DestPicker, FormatPicker, Interactive, Step};
 use crate::ui::term::FullTerm;
 use crate::ui::{self, ansi, detail, dim, error_line, heading, ok_line, oneshot, truncate, warn_line};
-use crate::upgrade::{self, Upgrade};
+use crate::upgrade::{self, InstalledUpgrade, Upgrade};
 use crate::ytdlp::{self, Event, Job, Outcome};
 use command::{FavArgs, Parsed};
 
@@ -48,7 +48,12 @@ pub fn run(config: Config, tool_opts: ToolOptions) -> Result<u8> {
     app.shutdown();
     drop(term); // leave the alternate screen before printing the summary
     app.print_summary();
-    result.map(|()| 0)
+    result?;
+    if let Some(installed) = app.restart {
+        println!("{}", ok_line(&installed.message()));
+        return installed.restart();
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -62,7 +67,7 @@ enum Msg {
     Finished(Result<Outcome, String>),
     ToolsUpdated,
     UpdateChecked(Result<Option<Upgrade>, String>),
-    Upgraded(Result<String, String>),
+    Upgraded(Result<Option<InstalledUpgrade>, String>),
 }
 
 struct PendingDownload {
@@ -117,8 +122,8 @@ fn spawn_worker(opts: ToolOptions, cancel: Arc<AtomicBool>, jobs: Receiver<Work>
                             None => upgrade::check(upgrade::CHECK_TIMEOUT)?,
                         };
                         match next {
-                            Some(next) => next.install(&mut report),
-                            None => Ok("yd is up to date".into()),
+                            Some(next) => next.install(&mut report).map(Some),
+                            None => Ok(None),
                         }
                     })();
                     Msg::Upgraded(result.map_err(|e| format!("{e:#}")))
@@ -364,6 +369,7 @@ struct App {
     failed: Vec<String>,
     quit: bool,
     quit_confirm: bool,
+    restart: Option<InstalledUpgrade>,
     started: Instant,
 }
 
@@ -414,6 +420,7 @@ impl App {
             failed: Vec::new(),
             quit: false,
             quit_confirm: false,
+            restart: None,
             started: Instant::now(),
         }
     }
@@ -551,10 +558,14 @@ impl App {
                 self.maintenance = false;
                 self.tool = None;
                 match res {
-                    Ok(message) => self.push(ok_line(&message)),
+                    Ok(Some(installed)) => {
+                        self.push(ok_line(&installed.message()));
+                        self.restart = Some(installed);
+                        self.quit = true;
+                    }
+                    Ok(None) => self.push(ok_line("yd is up to date")),
                     Err(e) => self.push(error_line(&e)),
                 }
-                self.pump();
             }
         }
     }
@@ -808,7 +819,7 @@ impl App {
             return;
         }
         // Several URLs at once: enqueue them all without waiting for Enter.
-        if s.split_whitespace().count() > 1
+        if !self.maintenance && self.pending_upgrade.is_none() && s.split_whitespace().count() > 1
             && let Some(urls) = command::extract_urls(s)
         {
             self.submit_urls(urls);
@@ -972,11 +983,16 @@ impl App {
         if text.is_empty() {
             return;
         }
+        let parsed = command::parse_input(&text);
+        if self.maintenance && matches!(parsed, Parsed::Urls(_) | Parsed::Inline(Ok(_))) {
+            self.push(warn_line("Wait for the update to finish before submitting URLs"));
+            return;
+        }
         self.composer.clear();
         self.popup_sel = 0;
         self.history.push(&text);
         self.persist_history();
-        match command::parse_input(&text) {
+        match parsed {
             Parsed::Empty => {}
             Parsed::Urls(urls) => self.submit_urls(urls),
             Parsed::Inline(Err(msg)) => {
@@ -1357,7 +1373,10 @@ mod tests {
     #[test]
     fn asks_on_each_submission_unless_destination_is_explicit() {
         let mut a = app();
-        a.maintenance = true; // Inspect queued jobs before they reach the worker.
+        let (job_tx, _jobs) = mpsc::channel();
+        a.job_tx = job_tx;
+        a.enqueue_with("https://example.com/first", a.spec, a.dest.clone(), false, false);
+        assert!(a.current.is_some()); // Keep later jobs queued without running them.
         let url = "https://example.com/video";
         a.submit_urls(vec![url.into()]);
         assert!(a.pending_download.is_some() && a.queue.is_empty());

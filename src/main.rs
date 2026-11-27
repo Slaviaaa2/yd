@@ -79,9 +79,12 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
 
     if interactive_terminal()
         && let Ok(Some(next)) = upgrade::check(Duration::from_secs(2))
-        && let Err(e) = offer_upgrade(&next)
     {
-        eprintln!("{}", ui::warn_line(&format!("{e:#}")));
+        match offer_upgrade(&next) {
+            Ok(Some(installed)) => return installed.restart(),
+            Ok(None) => {}
+            Err(e) => eprintln!("{}", ui::warn_line(&format!("{e:#}"))),
+        }
     }
 
     let mut cfg = load_config();
@@ -234,33 +237,39 @@ fn interactive_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-fn offer_upgrade(next: &upgrade::Upgrade) -> anyhow::Result<()> {
+fn offer_upgrade(next: &upgrade::Upgrade) -> anyhow::Result<Option<upgrade::InstalledUpgrade>> {
     if !interactive_terminal() {
         println!("{}", ui::heading(&format!("{} Run yd upgrade to install.", next.question())));
-        return Ok(());
+        return Ok(None);
     }
     print!("{} [y/N] ", next.question());
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        install_upgrade(next)?;
+        return install_upgrade(next).map(Some);
     }
-    Ok(())
+    Ok(None)
 }
 
-fn install_upgrade(next: &upgrade::Upgrade) -> anyhow::Result<()> {
+fn install_upgrade(next: &upgrade::Upgrade) -> anyhow::Result<upgrade::InstalledUpgrade> {
     let mut printer = ui::oneshot::ToolPrinter::with_title("Upgrading yd", false);
     let result = next.install(|event| printer.event(event));
     printer.finish();
-    println!("{}", ui::ok_line(&result?));
-    Ok(())
+    let installed = result?;
+    println!("{}", ui::ok_line(&installed.message()));
+    io::stdout().flush()?;
+    Ok(installed)
 }
 
 fn upgrade_cli(confirm: bool) -> anyhow::Result<u8> {
     match upgrade::check(upgrade::CHECK_TIMEOUT)? {
-        Some(next) if confirm => offer_upgrade(&next)?,
-        Some(next) => install_upgrade(&next)?,
+        Some(next) if confirm => {
+            offer_upgrade(&next)?;
+        }
+        Some(next) => {
+            install_upgrade(&next)?;
+        }
         None => println!("{}", ui::ok_line("yd is up to date")),
     }
     Ok(0)
