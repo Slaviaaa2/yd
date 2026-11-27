@@ -1,4 +1,4 @@
-# yd
+# <img src="assets/yd.svg" width="48" height="48" alt=""> yd
 
 URL を貼るだけで最短でダウンロードできる yt-dlp フロントエンド。
 ワンショットの CLI と、ターミナルを占有する対話モード（代替スクリーン）を持つ単一バイナリです。
@@ -26,7 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/Slaviaaa2/yd/master/install.sh | ba
 ```
 
 `~/.local/bin/yd` に入ります（`YD_INSTALL_DIR` で変更、`YD_VERSION=v1.0.0` で版指定）。
-Linux ではアプリケーションメニューへの登録を `[Y/n]` で聞きます（`~/.local/share/applications/yd.desktop`。`YD_MENU=yes|no` で質問を省略）。
+同じコマンドを再実行すると、同じインストール先にある yd を更新します。
+Linux では yd アイコン付きのアプリケーションメニューへの登録を `[Y/n]` で聞きます（`~/.local/share/applications/yd.desktop`。`YD_MENU=yes|no` で質問を省略）。
 
 **Windows（PowerShell 7 / Windows PowerShell）**
 
@@ -88,6 +89,12 @@ yd URL -- --limit-rate 2M  # -- 以降は yt-dlp にそのまま渡す
 
 例: `mp3:320`、`flac`、`mp4:1080`、`mkv:4k`、`gif:360`
 
+### yd 自体の更新
+
+- `yd update`（対話モードの `/update`）は yt-dlp などを更新し、yd の新バージョンがあれば確認します。
+- `yd upgrade`（対話モードの `/upgrade`）は最新バージョンを確認し、新しければその場でインストールします。
+- ターミナルから起動したときにも公開版を自動確認します。更新するには `y` を選びます。新しいバイナリは次回の起動から使われます。
+
 ### temp.sh へのアップロード
 
 `yd -p URL` の保存先ピッカー、または対話モードの `/o` で `Upload to temp.sh` を選ぶと、yt-dlp の処理完了後にファイルをアップロードしてリンクを表示します。アップロードに成功したファイルは手元から削除し、失敗時は一時フォルダに残して場所を表示します。
@@ -120,6 +127,8 @@ yd -o r:1 URL              # 2 番目に最近使った保存先へ
 | `/fav` | お気に入り・最近のフォルダの管理画面（下記）。`/fav <name>` は今の保存先を登録、`/fav rm <name>` は削除 |
 | `/settings`（`/set`） | 設定画面（下記） |
 | `/open` | 保存先をファイルマネージャで開く |
+| `/update` | 補助ツールを更新し、yd の新バージョンを確認 |
+| `/upgrade` | yd の最新バージョンをインストール |
 | `/help`, `/q` | ヘルプ、終了 |
 
 #### 1 行だけの上書き

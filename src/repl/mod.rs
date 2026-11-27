@@ -29,6 +29,7 @@ use crate::ui::input::{History, LineEditor};
 use crate::ui::picker::{DestChoice, DestPicker, FormatPicker, Interactive, Step};
 use crate::ui::term::FullTerm;
 use crate::ui::{self, ansi, detail, dim, error_line, heading, ok_line, oneshot, truncate, warn_line};
+use crate::upgrade::{self, Upgrade};
 use crate::ytdlp::{self, Event, Job, Outcome};
 use command::{FavArgs, Parsed};
 
@@ -56,6 +57,9 @@ enum Msg {
     ToolsReady(Result<(), String>),
     Ev(Event),
     Finished(Result<Outcome, String>),
+    ToolsUpdated,
+    UpdateChecked(Result<Option<Upgrade>, String>),
+    Upgraded(Result<String, String>),
 }
 
 struct QueuedJob {
@@ -65,19 +69,53 @@ struct QueuedJob {
     note: Option<String>,
 }
 
-fn spawn_worker(opts: ToolOptions, cancel: Arc<AtomicBool>, jobs: Receiver<QueuedJob>, tx: Sender<Msg>) {
+enum Work {
+    Download(QueuedJob),
+    Update,
+    Upgrade(Option<Upgrade>),
+}
+
+fn spawn_worker(opts: ToolOptions, cancel: Arc<AtomicBool>, jobs: Receiver<Work>, tx: Sender<Msg>) {
     std::thread::spawn(move || {
-        let tools = tools::ensure_tools(&opts, &mut |e| {
+        let mut report = |e| {
             let _ = tx.send(Msg::Tool(e));
-        })
+        };
+        let mut tools = tools::ensure_tools(&opts, &mut report)
         .map_err(|e| format!("{e:#}"));
         let _ = tx.send(Msg::ToolsReady(tools.as_ref().map(|_| ()).map_err(Clone::clone)));
-        for q in jobs {
-            let res = match &tools {
-                Ok(t) => run_job(&q, t, &cancel, &tx),
-                Err(e) => Err(e.clone()),
+        for task in jobs {
+            let message = match task {
+                Work::Download(q) => Msg::Finished(match &tools {
+                    Ok(t) => run_job(&q, t, &cancel, &tx),
+                    Err(e) => Err(e.clone()),
+                }),
+                Work::Update => {
+                    match tools::update_tools(&opts, &mut report) {
+                        Ok(updated) => {
+                            tools = Ok(updated);
+                            let _ = tx.send(Msg::ToolsUpdated);
+                        }
+                        Err(e) => {
+                            report(ToolEvent::Warn(format!("cannot update tools: {e:#}")));
+                        }
+                    }
+                    Msg::UpdateChecked(upgrade::check(upgrade::CHECK_TIMEOUT).map_err(|e| format!("{e:#}")))
+                }
+                Work::Upgrade(next) => {
+                    let result = (|| {
+                        let next = match next {
+                            Some(next) => Some(next),
+                            None => upgrade::check(upgrade::CHECK_TIMEOUT)?,
+                        };
+                        match next {
+                            Some(next) => next.install(&mut report),
+                            None => Ok("yd is up to date".into()),
+                        }
+                    })();
+                    Msg::Upgraded(result.map_err(|e| format!("{e:#}")))
+                }
             };
-            let _ = tx.send(Msg::Finished(res));
+            let _ = tx.send(message);
         }
     });
 }
@@ -293,7 +331,9 @@ struct App {
     tool: Option<(&'static str, u64, Option<u64>)>,
     tool_header: bool,
     playlist: Option<String>,
-    job_tx: Sender<QueuedJob>,
+    job_tx: Sender<Work>,
+    maintenance: bool,
+    pending_upgrade: Option<Upgrade>,
     rx: Receiver<Msg>,
     cancel: Arc<AtomicBool>,
     /// Lines waiting to be pushed into the scrollback.
@@ -341,6 +381,8 @@ impl App {
             tool_header: false,
             playlist: None,
             job_tx,
+            maintenance: false,
+            pending_upgrade: None,
             rx,
             cancel,
             scroll: Transcript::default(),
@@ -447,6 +489,29 @@ impl App {
             }
             Msg::Ev(ev) => self.on_download_event(ev, width),
             Msg::Finished(res) => self.on_finished(res),
+            Msg::ToolsUpdated => {
+                self.tool = None;
+                self.push(ok_line("Tools are up to date"));
+            }
+            Msg::UpdateChecked(res) => {
+                self.maintenance = false;
+                self.tool = None;
+                match res {
+                    Ok(Some(next)) => self.pending_upgrade = Some(next),
+                    Ok(None) => self.push(ok_line("yd is up to date")),
+                    Err(e) => self.push(error_line(&e)),
+                }
+                self.pump();
+            }
+            Msg::Upgraded(res) => {
+                self.maintenance = false;
+                self.tool = None;
+                match res {
+                    Ok(message) => self.push(ok_line(&message)),
+                    Err(e) => self.push(error_line(&e)),
+                }
+                self.pump();
+            }
         }
     }
 
@@ -591,7 +656,7 @@ impl App {
 
     /// Hand the next queued job to the worker when it is idle.
     fn pump(&mut self) {
-        if self.current.is_some() {
+        if self.current.is_some() || self.maintenance || self.pending_upgrade.is_some() {
             return;
         }
         let Some(q) = self.queue.pop_front() else { return };
@@ -609,7 +674,7 @@ impl App {
             note: q.note.clone(),
             cancelled: false,
         });
-        let _ = self.job_tx.send(q);
+        let _ = self.job_tx.send(Work::Download(q));
     }
 
     /// Ctrl+C while downloading: kill the current download and drop the queue.
@@ -721,6 +786,24 @@ impl App {
                 Step::Pending => {}
                 Step::Cancel => self.modal = self.parent.take(),
                 Step::Done(out) => self.on_modal_done(out),
+            }
+            return;
+        }
+        if self.pending_upgrade.is_some() {
+            match k.code {
+                KeyCode::Char('y' | 'Y') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let next = self.pending_upgrade.take();
+                    self.start_maintenance(Work::Upgrade(next), "Upgrading yd");
+                }
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.pending_upgrade = None;
+                    self.cancel_all();
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Enter | KeyCode::Esc => {
+                    self.pending_upgrade = None;
+                    self.pump();
+                }
+                _ => {}
             }
             return;
         }
@@ -891,10 +974,27 @@ impl App {
                     Err(e) => self.push(error_line(&format!("cannot open folder: {e}"))),
                 }
             }
+            "update" if args.is_empty() => self.start_maintenance(Work::Update, "Updating tools"),
+            "upgrade" if args.is_empty() => self.start_maintenance(Work::Upgrade(None), "Checking for a yd upgrade"),
+            "update" | "upgrade" => self.push(error_line(&format!("/{name} takes no arguments"))),
             "help" => self.print_help(),
             "q" => self.quit = true,
             _ => {}
         }
+    }
+
+    fn start_maintenance(&mut self, task: Work, title: &str) {
+        if self.current.is_some() || self.maintenance {
+            self.push(warn_line("Wait for the current task to finish"));
+            return;
+        }
+        if self.job_tx.send(task).is_err() {
+            self.push(error_line("Update worker unavailable"));
+            return;
+        }
+        self.maintenance = true;
+        self.tool_header = true;
+        self.push(heading(title));
     }
 
     fn run_fav(&mut self, args: &str) {
@@ -1051,6 +1151,10 @@ impl App {
             let cursor = cur.map(|(x, y)| (x, y + lines.len() as u16));
             lines.extend(body);
             return (lines, cursor);
+        }
+        if let Some(next) = &self.pending_upgrade {
+            lines.push(heading(&format!("{} [y/N]", next.question())));
+            return (lines, None);
         }
         let sug = self.suggestions();
         if let Some(sug) = &sug {

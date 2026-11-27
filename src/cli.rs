@@ -61,12 +61,14 @@ pub enum Command {
         #[command(subcommand)]
         action: FavAction,
     },
-    /// Update yt-dlp and helper tools
+    /// Update helper tools and check for a new yd version
     Update {
         /// Do not set up deno
         #[arg(long)]
         no_deno: bool,
     },
+    /// Install the latest published yd version
+    Upgrade,
     /// Print config file path and contents
     Config,
 }

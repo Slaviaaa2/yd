@@ -193,7 +193,8 @@ mod tests {
         assert_eq!(inserts(&s), ["/settings"]);
         assert_eq!(g, "ttings");
         let (s, _) = run("/");
-        assert_eq!(s.items.len(), 7);
+        assert_eq!(s.items.len(), command::COMMANDS.len());
+        assert_eq!(inserts(&run("/up").0), ["/update", "/upgrade"]);
         let (s, _) = run("https://a.com/x /");
         assert_eq!(inserts(&s), ["/f ", "/o ", "/force "]);
         let (s, g) = run("https://a.com/x /fo");

@@ -6,9 +6,11 @@ mod repl;
 mod temp_sh;
 mod tools;
 mod ui;
+mod upgrade;
 mod ytdlp;
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
+use std::time::Duration;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +28,8 @@ const EXIT_INTERRUPTED: u8 = 130;
 
 fn main() -> ExitCode {
     ui::init();
+    #[cfg(windows)]
+    upgrade::clean_old_executable();
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
@@ -60,6 +64,7 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
         Some(Command::Fav { action }) => return fav(action),
         Some(Command::Update { no_deno }) => return update(no_deno),
+        Some(Command::Upgrade) => return upgrade_cli(false),
         Some(Command::Config) => return show_config(),
         None => {}
     }
@@ -70,6 +75,13 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             return Ok(usage_error("--pick needs an interactive terminal"));
         }
+    }
+
+    if interactive_terminal()
+        && let Ok(Some(next)) = upgrade::check(Duration::from_secs(2))
+        && let Err(e) = offer_upgrade(&next)
+    {
+        eprintln!("{}", ui::warn_line(&format!("{e:#}")));
     }
 
     let mut cfg = load_config();
@@ -207,8 +219,48 @@ fn update(no_deno: bool) -> anyhow::Result<u8> {
     let mut tp = ui::oneshot::ToolPrinter::new(true);
     let r = tools::update_tools(&ToolOptions { skip_deno: no_deno }, &mut |e| tp.event(e));
     tp.finish();
-    r?;
-    println!("{}", ui::ok_line("Tools are up to date"));
+    if let Err(e) = &r {
+        eprintln!("{}", ui::error_line(&format!("{e:#}")));
+    } else {
+        println!("{}", ui::ok_line("Tools are up to date"));
+    }
+    let code = upgrade_cli(true)?;
+    Ok(if r.is_err() { EXIT_FAIL } else { code })
+}
+
+fn interactive_terminal() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn offer_upgrade(next: &upgrade::Upgrade) -> anyhow::Result<()> {
+    if !interactive_terminal() {
+        println!("{}", ui::heading(&format!("{} Run yd upgrade to install.", next.question())));
+        return Ok(());
+    }
+    print!("{} [y/N] ", next.question());
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        install_upgrade(next)?;
+    }
+    Ok(())
+}
+
+fn install_upgrade(next: &upgrade::Upgrade) -> anyhow::Result<()> {
+    let mut printer = ui::oneshot::ToolPrinter::with_title("Upgrading yd", false);
+    let result = next.install(|event| printer.event(event));
+    printer.finish();
+    println!("{}", ui::ok_line(&result?));
+    Ok(())
+}
+
+fn upgrade_cli(confirm: bool) -> anyhow::Result<u8> {
+    match upgrade::check(upgrade::CHECK_TIMEOUT)? {
+        Some(next) if confirm => offer_upgrade(&next)?,
+        Some(next) => install_upgrade(&next)?,
+        None => println!("{}", ui::ok_line("yd is up to date")),
+    }
     Ok(0)
 }
 

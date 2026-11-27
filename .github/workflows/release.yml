@@ -46,8 +46,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           pkg="yd-${{ matrix.name }}"
-          mkdir "$pkg"
+          mkdir -p "$pkg/assets"
           cp README.md "$pkg/"
+          cp assets/yd.svg "$pkg/assets/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp "target/${{ matrix.target }}/release/yd.exe" "$pkg/"
             7z a "$pkg.zip" "$pkg" >/dev/null

@@ -1,6 +1,6 @@
 [package]
 name = "yd"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Fast, friendly yt-dlp front-end: one-shot CLI and interactive TUI"
 repository = "https://github.com/Slaviaaa2/yd"
@@ -19,9 +19,12 @@ clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 ctrlc = "3.5.2"
 dirs = "7.0.0"
+flate2 = "1"
 ratatui = "0.30.2"
+semver = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = { version = "0.10", features = ["std"] }
 tar = "0.4.46"
 toml = "1.2.1"
 unicode-width = "0.2.3"
@@ -33,3 +36,6 @@ zip = "9.5.1"
 lto = true
 codegen-units = 1
 strip = true
+
+[build-dependencies]
+winresource = "0.1.34"

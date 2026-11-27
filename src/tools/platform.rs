@@ -34,6 +34,7 @@ pub struct Target {
 pub enum ArchiveKind {
     Zip,
     TarXz,
+    TarGz,
 }
 
 /// A downloadable archive from which only `files` are extracted (flat, into the tools dir).

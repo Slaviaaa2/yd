@@ -34,7 +34,8 @@ fi
 
 command -v curl >/dev/null || die "curl is required"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+staged=
+trap 'rm -rf "$tmp"; if [ -n "$staged" ]; then rm -f "$staged"; fi' EXIT
 
 say "Downloading ${asset} (${version})"
 curl -fL --progress-bar "$url" -o "$tmp/$asset" || die "download failed: $url"
@@ -42,16 +43,53 @@ tar -xzf "$tmp/$asset" -C "$tmp"
 bin="$(find "$tmp" -type f -name yd | head -n1)"
 [ -n "$bin" ] || die "yd binary not found in archive"
 
+# Resolve links to their final target, including relative links on macOS.
+resolve_target() {
+  local path="$1" parent link hops=0
+  while :; do
+    parent="$(cd -P -- "$(dirname "$path")" && pwd)" || return 1
+    path="$parent/$(basename "$path")"
+    if [ ! -L "$path" ]; then
+      printf '%s\n' "$path"
+      return
+    fi
+    [ "$hops" -lt 40 ] || return 1
+    hops=$((hops + 1))
+    link="$(readlink "$path")" || return 1
+    case "$link" in
+      /*) path="$link" ;;
+      *)  path="$parent/$link" ;;
+    esac
+  done
+}
+
 mkdir -p "$dir"
-install -m 755 "$bin" "$dir/yd"
-printf '\033[32m✔\033[0m Installed %s\n' "$dir/yd"
+target="$(resolve_target "$dir/yd")" || die "cannot resolve $dir/yd"
+action=Installed
+if [ -e "$target" ]; then
+  [ -f "$target" ] || die "$target is not a regular file"
+  action=Updated
+fi
+staged="$(mktemp "$(dirname "$target")/.yd-install.XXXXXXXX")"
+install -m 755 "$bin" "$staged"
+mv -f "$staged" "$target"
+staged=
+printf '\033[32m✔\033[0m %s %s\n' "$action" "$dir/yd"
 "$dir/yd" --version 2>/dev/null | sed 's/^/  └ /' || true
 
 # Application menu entry (Linux desktop). `curl | bash` has the script on stdin,
 # so the question is read from /dev/tty; without a terminal it is skipped unless YD_MENU=yes.
 add_menu_entry() {
-  local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local apps="$data/applications"
   local file="$apps/yd.desktop"
+  local icon="folder-download"
+  if [ -f "$(dirname "$bin")/assets/yd.svg" ]; then
+    local icons="$data/icons/hicolor/scalable/apps"
+    mkdir -p "$icons"
+    install -m 644 "$(dirname "$bin")/assets/yd.svg" "$icons/yd.svg"
+    icon="yd"
+  fi
   mkdir -p "$apps"
   cat >"$file" <<EOF
 [Desktop Entry]
@@ -60,7 +98,7 @@ Name=yd
 GenericName=Video & Audio Downloader
 Comment=Fast yt-dlp front-end: paste a URL to download video or audio
 Exec="$dir/yd"
-Icon=folder-download
+Icon=$icon
 Terminal=true
 Categories=Network;FileTransfer;
 Keywords=youtube;yt-dlp;download;video;audio;mp3;

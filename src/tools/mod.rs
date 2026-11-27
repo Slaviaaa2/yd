@@ -5,8 +5,8 @@
 //!
 //! Layout: `platform` (OS/arch asset matrix), `download` (HTTP, extraction, atomic install).
 
-mod download;
-mod platform;
+pub(crate) mod download;
+pub(crate) mod platform;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

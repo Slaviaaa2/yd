@@ -240,6 +240,7 @@ pub fn already_lines(path: &Path) -> Vec<String> {
 /// Renders tool setup events. Quiet unless something is downloaded or goes wrong
 /// (`verbose` also shows tools that were found, used by `yd update`).
 pub struct ToolPrinter {
+    title: &'static str,
     verbose: bool,
     live: Live,
     header: bool,
@@ -247,7 +248,12 @@ pub struct ToolPrinter {
 
 impl ToolPrinter {
     pub fn new(verbose: bool) -> Self {
+        Self::with_title("Setting up tools", verbose)
+    }
+
+    pub fn with_title(title: &'static str, verbose: bool) -> Self {
         ToolPrinter {
+            title,
             verbose,
             live: Live::new(),
             header: false,
@@ -256,7 +262,7 @@ impl ToolPrinter {
 
     fn header(&mut self) {
         if !self.header {
-            println!("{}", heading("Setting up tools"));
+            println!("{}", heading(self.title));
             self.header = true;
         }
     }

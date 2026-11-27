@@ -171,9 +171,13 @@ pub fn extract_files(
                 }
             }
         }
-        ArchiveKind::TarXz => {
-            let xz = xz2::read::XzDecoder::new(io::BufReader::new(File::open(archive)?));
-            let mut tar = tar::Archive::new(xz);
+        ArchiveKind::TarXz | ArchiveKind::TarGz => {
+            let file = io::BufReader::new(File::open(archive)?);
+            let decoder: Box<dyn Read> = match kind {
+                ArchiveKind::TarXz => Box::new(xz2::read::XzDecoder::new(file)),
+                _ => Box::new(flate2::bufread::GzDecoder::new(file)),
+            };
+            let mut tar = tar::Archive::new(decoder);
             for entry in tar.entries()? {
                 let mut entry = entry?;
                 if !entry.header().entry_type().is_file() {

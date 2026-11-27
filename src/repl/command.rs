@@ -10,7 +10,7 @@ pub struct Cmd {
     pub help: &'static str,
 }
 
-pub const COMMANDS: [Cmd; 7] = [
+pub const COMMANDS: [Cmd; 9] = [
     Cmd {
         name: "f",
         aliases: &["format"],
@@ -40,6 +40,18 @@ pub const COMMANDS: [Cmd; 7] = [
         aliases: &["set"],
         args: "",
         help: "Open the settings screen",
+    },
+    Cmd {
+        name: "update",
+        aliases: &[],
+        args: "",
+        help: "Update helper tools and check for a new yd version",
+    },
+    Cmd {
+        name: "upgrade",
+        aliases: &[],
+        args: "",
+        help: "Install the latest published yd version",
     },
     Cmd {
         name: "help",
@@ -318,7 +330,7 @@ mod tests {
     #[test]
     fn command_matching() {
         let names = |p: &str| matching(p).iter().map(|c| c.name).collect::<Vec<_>>();
-        assert_eq!(names(""), ["f", "o", "fav", "open", "settings", "help", "q"]);
+        assert_eq!(names(""), ["f", "o", "fav", "open", "settings", "update", "upgrade", "help", "q"]);
         assert_eq!(names("se"), ["settings"]);
         assert_eq!(names("f"), ["f", "fav"]);
         assert_eq!(names("fo"), ["f"]);
