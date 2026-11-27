@@ -517,28 +517,47 @@ enum DestStage {
     Input,
 }
 
+#[derive(Clone)]
+pub enum DestChoice<T = String> {
+    Local(T),
+    TempSh,
+}
+
 pub struct DestPicker {
     stage: DestStage,
     picker: Picker,
-    /// Per list item: the path to use; `None` for the "Enter a path" row.
-    paths: Vec<Option<String>>,
+    /// `None` opens the path editor.
+    choices: Vec<Option<DestChoice>>,
     input: PathInput,
 }
 
 impl DestPicker {
     pub fn new(cfg: &Config, current: &Path) -> Self {
+        Self::build(cfg, current, None)
+    }
+
+    pub fn with_upload(cfg: &Config, current: &Path, uploading: bool) -> Self {
+        Self::build(cfg, current, Some(uploading))
+    }
+
+    fn build(cfg: &Config, current: &Path, uploading: Option<bool>) -> Self {
         let mut items = Vec::new();
-        let mut paths = Vec::new();
+        let mut choices = Vec::new();
         let mut cur = None;
         let is_cur = |p: &Path| p == current;
         let fav_paths: Vec<&PathBuf> = cfg.favorites.iter().map(|f| &f.path).collect();
         // The current destination always appears, even when it is neither favorite nor recent.
         let known = fav_paths.iter().any(|p| is_cur(p)) || cfg.recent.iter().any(|p| is_cur(p));
-        if !known {
+        if uploading.is_some() {
+            items.push(Item::new("Save on this computer", super::abbrev_home(current)));
+            choices.push(Some(DestChoice::Local(current.display().to_string())));
+            items.push(Item::new("Upload to temp.sh", ""));
+            choices.push(Some(DestChoice::TempSh));
+        } else if !known {
             let mut it = Item::new(format!("\u{b7} {}", super::abbrev_home(current)), "current");
             it.search = current.display().to_string();
             items.push(it);
-            paths.push(Some(current.display().to_string()));
+            choices.push(Some(DestChoice::Local(current.display().to_string())));
             cur = Some(0);
         }
         for (i, f) in cfg.favorites.iter().enumerate() {
@@ -548,7 +567,7 @@ impl DestPicker {
             let mut it = Item::new(format!("f:{i} \u{2605} {}", f.name), super::abbrev_home(&f.path));
             it.search = f.path.display().to_string();
             items.push(it);
-            paths.push(Some(f.path.display().to_string()));
+            choices.push(Some(DestChoice::Local(f.path.display().to_string())));
         }
         for (i, r) in cfg.recent.iter().enumerate().filter(|(_, r)| !fav_paths.contains(r)) {
             if is_cur(r) {
@@ -557,28 +576,28 @@ impl DestPicker {
             let mut it = Item::new(format!("r:{i} \u{b7} {}", super::abbrev_home(r)), "");
             it.search = r.display().to_string();
             items.push(it);
-            paths.push(Some(r.display().to_string()));
+            choices.push(Some(DestChoice::Local(r.display().to_string())));
         }
         let mut enter = Item::new("+ Enter a path\u{2026}", "");
         enter.sticky = true;
         items.push(enter);
-        paths.push(None);
+        choices.push(None);
         DestPicker {
             stage: DestStage::List,
-            picker: Picker::new("Save to", items, cur),
-            paths,
+            picker: Picker::new("Save to", items, uploading.map(usize::from).or(cur)),
+            choices,
             input: PathInput::new(),
         }
     }
 }
 
 impl Interactive for DestPicker {
-    type Out = String;
+    type Out = DestChoice;
 
-    fn key(&mut self, k: KeyEvent) -> Step<String> {
+    fn key(&mut self, k: KeyEvent) -> Step<DestChoice> {
         match self.stage {
             DestStage::List => match self.picker.key(k) {
-                Step::Done(i) => match &self.paths[i] {
+                Step::Done(i) => match &self.choices[i] {
                     Some(p) => Step::Done(p.clone()),
                     None => {
                         self.stage = DestStage::Input;
@@ -589,11 +608,12 @@ impl Interactive for DestPicker {
                 Step::Pending => Step::Pending,
             },
             DestStage::Input => match self.input.key(k) {
+                Step::Done(path) => Step::Done(DestChoice::Local(path)),
                 Step::Cancel => {
                     self.stage = DestStage::List;
                     Step::Pending
                 }
-                other => other,
+                Step::Pending => Step::Pending,
             },
         }
     }
@@ -670,8 +690,11 @@ pub fn pick_format(current: &FormatSpec) -> Result<Option<FormatSpec>> {
 }
 
 /// Convenience used by `--pick`: ask for a destination and create it. `None` = cancelled.
-pub fn pick_dest(cfg: &Config, current: &Path) -> Result<Option<PathBuf>> {
-    run(DestPicker::new(cfg, current), |s| cfg.resolve_dest(&s).map_err(|e| format!("{e:#}")))
+pub fn pick_dest(cfg: &Config, current: &Path) -> Result<Option<DestChoice<PathBuf>>> {
+    run(DestPicker::with_upload(cfg, current, false), |choice| match choice {
+        DestChoice::Local(path) => cfg.resolve_dest(&path).map(DestChoice::Local).map_err(|e| format!("{e:#}")),
+        DestChoice::TempSh => Ok(DestChoice::TempSh),
+    })
 }
 
 #[cfg(test)]
@@ -755,7 +778,7 @@ mod tests {
             dp.key(key(KeyCode::Char(c)));
         }
         assert_eq!(dp.picker.matches().len(), 2);
-        assert!(matches!(dp.key(key(KeyCode::Enter)), Step::Done(p) if p == "/r2"));
+        assert!(matches!(dp.key(key(KeyCode::Enter)), Step::Done(DestChoice::Local(p)) if p == "/r2"));
         let mut dp = DestPicker::new(&cfg, Path::new("/elsewhere"));
         assert_eq!(dp.picker.items[0].detail, "current");
         for c in "zzz".chars() {
@@ -766,7 +789,7 @@ mod tests {
         for c in "/tmp".chars() {
             dp.key(key(KeyCode::Char(c)));
         }
-        assert!(matches!(dp.key(key(KeyCode::Enter)), Step::Done(p) if p == "/tmp"));
+        assert!(matches!(dp.key(key(KeyCode::Enter)), Step::Done(DestChoice::Local(p)) if p == "/tmp"));
     }
 
     #[test]

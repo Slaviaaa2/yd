@@ -26,6 +26,7 @@ const M_DONE: &str = "YDD ";
 #[derive(Debug, Clone)]
 pub struct Job {
     pub url: String,
+    pub upload: bool,
     /// Destination directory (`-P`).
     pub dest: PathBuf,
     /// Output template (relative to `dest`).
@@ -69,6 +70,9 @@ pub enum Event {
     AlreadyDownloaded {
         path: PathBuf,
     },
+    Uploading,
+    Uploaded(String),
+    UploadRetained(PathBuf),
     Warning(String),
     Error(String),
 }
@@ -175,6 +179,20 @@ fn pump<R: Read + Send + 'static>(r: R, tx: mpsc::Sender<Line>, wrap: fn(String)
 /// Run yt-dlp for one URL, reporting events as they happen.
 /// Set `cancel` (e.g. from a Ctrl-C handler) to kill the child; `Outcome::cancelled` is then true.
 pub fn run(
+    job: &Job,
+    built: &BuiltArgs,
+    tools: &Tools,
+    cancel: &AtomicBool,
+    on_event: impl FnMut(Event),
+) -> Result<Outcome> {
+    if job.upload {
+        crate::temp_sh::run(job, built, tools, cancel, on_event)
+    } else {
+        run_download(job, built, tools, cancel, on_event)
+    }
+}
+
+pub(crate) fn run_download(
     job: &Job,
     built: &BuiltArgs,
     tools: &Tools,

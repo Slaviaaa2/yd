@@ -26,7 +26,7 @@ use crate::config::{self, Config};
 use crate::format::{DEFAULT_TEMPLATE, FormatSpec};
 use crate::tools::{self, ToolEvent, ToolOptions, Tools};
 use crate::ui::input::{History, LineEditor};
-use crate::ui::picker::{DestPicker, FormatPicker, Interactive, Step};
+use crate::ui::picker::{DestChoice, DestPicker, FormatPicker, Interactive, Step};
 use crate::ui::term::FullTerm;
 use crate::ui::{self, ansi, detail, dim, error_line, heading, ok_line, oneshot, truncate, warn_line};
 use crate::ytdlp::{self, Event, Job, Outcome};
@@ -107,6 +107,7 @@ struct Running {
     started: Instant,
     label: String,
     dest: PathBuf,
+    upload: bool,
     note: Option<String>,
     cancelled: bool,
 }
@@ -120,7 +121,7 @@ enum Modal {
 
 enum ModalOut {
     Format(FormatSpec),
-    Dest(String),
+    Dest(DestChoice),
 }
 
 impl Modal {
@@ -275,6 +276,7 @@ struct App {
     cfg: Config,
     spec: FormatSpec,
     dest: PathBuf,
+    upload: bool,
     composer: LineEditor,
     history: History,
     popup_sel: usize,
@@ -298,6 +300,8 @@ struct App {
     scroll: Transcript,
     /// Session summary data.
     saved: Vec<PathBuf>,
+    uploaded: Vec<String>,
+    upload_retained: Vec<PathBuf>,
     skipped: usize,
     failed: Vec<String>,
     quit: bool,
@@ -323,6 +327,7 @@ impl App {
             cfg,
             spec,
             dest,
+            upload: false,
             composer: LineEditor::default(),
             history: History::from_items(initial_history),
             popup_sel: 0,
@@ -340,6 +345,8 @@ impl App {
             cancel,
             scroll: Transcript::default(),
             saved: Vec::new(),
+            uploaded: Vec::new(),
+            upload_retained: Vec::new(),
             skipped: 0,
             failed: Vec::new(),
             quit: false,
@@ -407,6 +414,8 @@ impl App {
             }
             match self.rx.recv_timeout(left) {
                 Ok(Msg::Finished(_)) => self.current = None,
+                Ok(Msg::Ev(Event::Uploaded(link))) => self.uploaded.push(link),
+                Ok(Msg::Ev(Event::UploadRetained(path))) => self.upload_retained.push(path),
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
@@ -450,7 +459,7 @@ impl App {
 
     fn on_download_event(&mut self, ev: Event, width: usize) {
         let Some(run) = self.current.as_mut() else { return };
-        if run.cancelled {
+        if run.cancelled && !matches!(ev, Event::Uploaded(_) | Event::UploadRetained(_)) {
             return;
         }
         match ev {
@@ -491,6 +500,19 @@ impl App {
                 self.scroll.extend(lines);
                 self.saved.push(path);
             }
+            Event::Uploading => {
+                run.percent = None;
+                run.stage = Some("Uploading to temp.sh");
+            }
+            Event::Uploaded(link) => {
+                run.stage = None;
+                self.scroll.push(ok_line(&format!("Uploaded {link}")));
+                self.uploaded.push(link);
+            }
+            Event::UploadRetained(path) => {
+                self.scroll.push(warn_line(&format!("Files kept in {}", ui::abbrev_home(&path))));
+                self.upload_retained.push(path);
+            }
             Event::AlreadyDownloaded { path } => {
                 run.percent = None;
                 self.skipped += 1;
@@ -514,6 +536,7 @@ impl App {
                     && !o.cancelled
                     && (o.success() || !o.saved.is_empty() || !o.already.is_empty())
                     && let Some(r) = &run
+                    && !r.upload
                 {
                     self.cfg.push_recent(&r.dest);
                     self.save_cfg();
@@ -535,15 +558,17 @@ impl App {
     // ----- queue -------------------------------------------------------------------------
 
     fn enqueue(&mut self, url: &str) {
-        self.enqueue_with(url, self.spec, self.dest.clone(), false);
+        self.enqueue_with(url, self.spec, self.dest.clone(), self.upload, false);
     }
 
-    fn enqueue_with(&mut self, url: &str, spec: FormatSpec, dest: PathBuf, force: bool) {
+    fn enqueue_with(&mut self, url: &str, spec: FormatSpec, dest: PathBuf, upload: bool, force: bool) {
         let mut note = Vec::new();
         if spec != self.spec {
             note.push(spec.to_string());
         }
-        if dest != self.dest {
+        if upload {
+            note.push("→ temp.sh".into());
+        } else if dest != self.dest || self.upload {
             note.push(format!("\u{2192} {}", ui::abbrev_home(&dest)));
         }
         if force {
@@ -552,6 +577,7 @@ impl App {
         let note = (!note.is_empty()).then(|| note.join(" "));
         let job = Job {
             url: url.to_string(),
+            upload,
             dest,
             template: self.cfg.template.clone().unwrap_or_else(|| DEFAULT_TEMPLATE.to_string()),
             force: force || self.cfg.settings.force,
@@ -579,6 +605,7 @@ impl App {
             started: Instant::now(),
             label: q.spec.to_string(),
             dest: q.job.dest.clone(),
+            upload: q.job.upload,
             note: q.note.clone(),
             cancelled: false,
         });
@@ -831,8 +858,9 @@ impl App {
             Some(Err(e)) => return self.push(error_line(&format!("{e:#}"))),
             None => self.dest.clone(),
         };
+        let upload = self.upload && inl.dest.is_none();
         for u in &inl.urls {
-            self.enqueue_with(u, spec, PathBuf::clone(&dest), inl.force);
+            self.enqueue_with(u, spec, dest.clone(), upload, inl.force);
         }
     }
 
@@ -846,7 +874,7 @@ impl App {
                 Err(e) => self.push(error_line(&e)),
             },
             "o" if args.is_empty() => {
-                self.modal = Some(Modal::Dest(DestPicker::new(&self.cfg, &self.dest)));
+                self.modal = Some(Modal::Dest(DestPicker::with_upload(&self.cfg, &self.dest, self.upload)));
             }
             "o" => match self.cfg.resolve_dest(args) {
                 Ok(d) => self.set_dest(d),
@@ -922,6 +950,7 @@ impl App {
         self.cfg.push_recent(&dir);
         self.save_cfg();
         self.dest = dir.clone();
+        self.upload = false;
         dir
     }
 
@@ -937,7 +966,12 @@ impl App {
                 self.modal = self.parent.take();
                 self.set_format(s);
             }
-            ModalOut::Dest(s) => match self.cfg.resolve_dest(&s) {
+            ModalOut::Dest(DestChoice::TempSh) => {
+                self.modal = self.parent.take();
+                self.upload = true;
+                self.push(ok_line("Upload to temp.sh"));
+            }
+            ModalOut::Dest(DestChoice::Local(s)) => match self.cfg.resolve_dest(&s) {
                 Ok(d) => {
                     self.modal = self.parent.take();
                     self.set_dest(d);
@@ -1086,11 +1120,16 @@ impl App {
     }
 
     fn print_summary(&self) {
-        if !self.cfg.settings.exit_summary {
-            return;
+        if self.cfg.settings.exit_summary {
+            for l in self.summary_lines() {
+                println!("{l}");
+            }
         }
-        for l in self.summary_lines() {
-            println!("{l}");
+        for link in &self.uploaded {
+            println!("{}", ok_line(&format!("Uploaded {link}")));
+        }
+        for path in &self.upload_retained {
+            println!("{}", warn_line(&format!("Files kept in {}", ui::abbrev_home(path))));
         }
     }
 }

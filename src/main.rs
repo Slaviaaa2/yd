@@ -3,6 +3,7 @@ mod clipboard;
 mod config;
 mod format;
 mod repl;
+mod temp_sh;
 mod tools;
 mod ui;
 mod ytdlp;
@@ -93,6 +94,7 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
         },
         None => cfg.default_dest(),
     };
+    let mut upload = false;
     if cli.pick {
         let Some(picked) = ui::picker::pick_format(&spec)? else {
             eprintln!("{}", ui::error_line("Cancelled"));
@@ -103,8 +105,17 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
             eprintln!("{}", ui::error_line("Cancelled"));
             return Ok(EXIT_INTERRUPTED);
         };
-        dest = picked;
-        println!("{}", ui::dim(format!("  {spec} \u{2192} {}", ui::abbrev_home(&dest))));
+        let label = match picked {
+            ui::picker::DestChoice::Local(local) => {
+                dest = local;
+                ui::abbrev_home(&dest)
+            }
+            ui::picker::DestChoice::TempSh => {
+                upload = true;
+                "temp.sh".into()
+            }
+        };
+        println!("{}", ui::dim(format!("  {spec} \u{2192} {label}")));
     }
     let template =
         cli.template.clone().or_else(|| cfg.template.clone()).unwrap_or_else(|| format::DEFAULT_TEMPLATE.to_string());
@@ -136,6 +147,7 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
     for url in &cli.urls {
         let job = ytdlp::Job {
             url: url.clone(),
+            upload,
             dest: dest.clone(),
             template: template.clone(),
             force: cli.force,
@@ -150,7 +162,11 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
             return Ok(EXIT_INTERRUPTED);
         }
         if outcome.success() || !outcome.saved.is_empty() || !outcome.already.is_empty() {
-            cfg.record_download(&dest, &spec.canonical());
+            if upload {
+                cfg.last_format = Some(spec.canonical());
+            } else {
+                cfg.record_download(&dest, &spec.canonical());
+            }
             if let Err(e) = cfg.save() {
                 println!("{}", ui::warn_line(&format!("cannot save config: {e:#}")));
             }

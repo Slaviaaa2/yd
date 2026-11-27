@@ -1,6 +1,6 @@
 [package]
 name = "yd"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "Fast, friendly yt-dlp front-end: one-shot CLI and interactive TUI"
 repository = "https://github.com/Slaviaaa2/yd"

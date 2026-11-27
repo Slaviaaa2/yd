@@ -142,6 +142,19 @@ impl Printer {
                 }
                 flush();
             }
+            Event::Uploading => {
+                self.live.clear();
+                println!("{}", heading("Uploading to temp.sh"));
+                flush();
+            }
+            Event::Uploaded(link) => {
+                println!("{}", ok_line(&format!("Uploaded {link}")));
+                flush();
+            }
+            Event::UploadRetained(path) => {
+                println!("{}", warn_line(&format!("Files kept in {}", abbrev_home(&path))));
+                flush();
+            }
             Event::Warning(msg) => {
                 self.live.clear();
                 println!("{}", warn_line(&truncate(&msg, term_width().saturating_sub(2))));
