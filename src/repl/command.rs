@@ -10,7 +10,7 @@ pub struct Cmd {
     pub help: &'static str,
 }
 
-pub const COMMANDS: [Cmd; 9] = [
+pub const COMMANDS: [Cmd; 10] = [
     Cmd {
         name: "f",
         aliases: &["format"],
@@ -20,7 +20,7 @@ pub const COMMANDS: [Cmd; 9] = [
     Cmd {
         name: "o",
         aliases: &["out"],
-        args: "[fav|path]",
+        args: "[fav|path|ex:tempsh]",
         help: "Choose where files are saved",
     },
     Cmd {
@@ -52,6 +52,12 @@ pub const COMMANDS: [Cmd; 9] = [
         aliases: &[],
         args: "",
         help: "Install the latest published yd version",
+    },
+    Cmd {
+        name: "history",
+        aliases: &[],
+        args: "",
+        help: "View inputs and results from past sessions",
     },
     Cmd {
         name: "help",
@@ -330,7 +336,7 @@ mod tests {
     #[test]
     fn command_matching() {
         let names = |p: &str| matching(p).iter().map(|c| c.name).collect::<Vec<_>>();
-        assert_eq!(names(""), ["f", "o", "fav", "open", "settings", "update", "upgrade", "help", "q"]);
+        assert_eq!(names(""), ["f", "o", "fav", "open", "settings", "update", "upgrade", "history", "help", "q"]);
         assert_eq!(names("se"), ["settings"]);
         assert_eq!(names("f"), ["f", "fav"]);
         assert_eq!(names("fo"), ["f"]);

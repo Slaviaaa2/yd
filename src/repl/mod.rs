@@ -4,10 +4,12 @@
 mod command;
 mod highlight;
 mod modals;
+mod session_log;
 mod suggest;
 mod view;
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use unicode_width::UnicodeWidthStr;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -41,6 +43,7 @@ pub fn run(config: Config, tool_opts: ToolOptions) -> Result<u8> {
     let mut term = FullTerm::new()?;
     let mut app = App::new(config, tool_opts);
     app.print_card();
+    app.sync_session_log();
     let result = app.event_loop(&mut term);
     app.shutdown();
     drop(term); // leave the alternate screen before printing the summary
@@ -60,6 +63,12 @@ enum Msg {
     ToolsUpdated,
     UpdateChecked(Result<Option<Upgrade>, String>),
     Upgraded(Result<String, String>),
+}
+
+struct PendingDownload {
+    urls: Vec<String>,
+    spec: FormatSpec,
+    force: bool,
 }
 
 struct QueuedJob {
@@ -236,6 +245,7 @@ const TRANSCRIPT_MAX: usize = 3000;
 #[derive(Default)]
 struct Transcript {
     lines: Vec<String>,
+    log: Option<File>,
     ver: u64,
     /// Wrapped lines above the bottom (0 = follow output).
     off: usize,
@@ -249,6 +259,12 @@ struct Transcript {
 
 impl Transcript {
     fn push(&mut self, s: String) {
+        if let Some(log) = &mut self.log
+            && let Err(e) = session_log::append(log, &s)
+        {
+            self.log = None;
+            self.push(warn_line(&format!("cannot save session history: {e}")));
+        }
         self.lines.push(s);
         self.ver += 1;
         if self.lines.len() > TRANSCRIPT_MAX + 500 {
@@ -334,10 +350,12 @@ struct App {
     job_tx: Sender<Work>,
     maintenance: bool,
     pending_upgrade: Option<Upgrade>,
+    pending_download: Option<PendingDownload>,
     rx: Receiver<Msg>,
     cancel: Arc<AtomicBool>,
     /// Lines waiting to be pushed into the scrollback.
     scroll: Transcript,
+    history_view: Option<Transcript>,
     /// Session summary data.
     saved: Vec<PathBuf>,
     uploaded: Vec<String>,
@@ -345,6 +363,7 @@ struct App {
     skipped: usize,
     failed: Vec<String>,
     quit: bool,
+    quit_confirm: bool,
     started: Instant,
 }
 
@@ -383,21 +402,47 @@ impl App {
             job_tx,
             maintenance: false,
             pending_upgrade: None,
+            pending_download: None,
             rx,
             cancel,
             scroll: Transcript::default(),
+            history_view: None,
             saved: Vec::new(),
             uploaded: Vec::new(),
             upload_retained: Vec::new(),
             skipped: 0,
             failed: Vec::new(),
             quit: false,
+            quit_confirm: false,
             started: Instant::now(),
         }
     }
 
     fn push(&mut self, line: impl Into<String>) {
         self.scroll.push(line.into());
+    }
+
+    fn sync_session_log(&mut self) {
+        if !self.cfg.settings.history_persist {
+            self.scroll.log = None;
+        } else if self.scroll.log.is_none() {
+            match session_log::open_session(&config::session_history_dir()) {
+                Ok(log) => self.scroll.log = Some(log),
+                Err(e) => self.push(warn_line(&format!("cannot save session history: {e}"))),
+            }
+        }
+    }
+
+    fn open_session_history(&mut self) {
+        match session_log::read_sessions(&config::session_history_dir()) {
+            Ok(mut lines) => {
+                if lines.is_empty() {
+                    lines.push(detail("No recorded sessions"));
+                }
+                self.history_view = Some(Transcript { lines, ..Default::default() });
+            }
+            Err(e) => self.push(error_line(&format!("cannot read session history: {e}"))),
+        }
     }
 
     fn fav_name_for(&self, dir: &Path) -> Option<&str> {
@@ -456,8 +501,7 @@ impl App {
             }
             match self.rx.recv_timeout(left) {
                 Ok(Msg::Finished(_)) => self.current = None,
-                Ok(Msg::Ev(Event::Uploaded(link))) => self.uploaded.push(link),
-                Ok(Msg::Ev(Event::UploadRetained(path))) => self.upload_retained.push(path),
+                Ok(Msg::Ev(ev)) => self.on_download_event(ev, 80),
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
@@ -622,8 +666,17 @@ impl App {
 
     // ----- queue -------------------------------------------------------------------------
 
-    fn enqueue(&mut self, url: &str) {
-        self.enqueue_with(url, self.spec, self.dest.clone(), self.upload, false);
+    fn enqueue_batch(&mut self, batch: PendingDownload, dest: PathBuf, upload: bool) {
+        for url in batch.urls {
+            self.enqueue_with(&url, batch.spec, dest.clone(), upload, batch.force);
+        }
+    }
+
+    fn submit_urls(&mut self, urls: Vec<String>) {
+        for url in &urls {
+            self.push(dim(format!("› {url}")));
+        }
+        self.enqueue_inline(command::Inline { urls, ..Default::default() });
     }
 
     fn enqueue_with(&mut self, url: &str, spec: FormatSpec, dest: PathBuf, upload: bool, force: bool) {
@@ -747,6 +800,9 @@ impl App {
     }
 
     fn on_paste(&mut self, s: &str) {
+        if self.history_view.is_some() || self.quit_confirm {
+            return;
+        }
         if let Some(m) = self.modal.as_mut() {
             m.paste(s);
             return;
@@ -755,10 +811,7 @@ impl App {
         if s.split_whitespace().count() > 1
             && let Some(urls) = command::extract_urls(s)
         {
-            for u in urls {
-                self.push(dim(format!("\u{203a} {u}")));
-                self.enqueue(&u);
-            }
+            self.submit_urls(urls);
             return;
         }
         self.composer.insert_str(s);
@@ -773,6 +826,30 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(history) = &mut self.history_view {
+            match k.code {
+                _ if ctrl_c => self.history_view = None,
+                KeyCode::Esc => self.history_view = None,
+                KeyCode::Up => history.up(1),
+                KeyCode::Down => history.down(1),
+                KeyCode::PageUp => history.up(history.page),
+                KeyCode::PageDown => history.down(history.page),
+                KeyCode::Home => history.off = history.last_total,
+                KeyCode::End => history.off = 0,
+                _ => {}
+            }
+            return;
+        }
+        if self.quit_confirm {
+            match k.code {
+                _ if ctrl_c => self.quit = true,
+                KeyCode::Char('y' | 'Y') if !k.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+                KeyCode::Char('n' | 'N') | KeyCode::Enter | KeyCode::Esc => self.quit_confirm = false,
+                _ => {}
+            }
+            return;
+        }
         if k.code == KeyCode::Char('v') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return self.on_clipboard(crate::clipboard::read_text());
         }
@@ -784,7 +861,10 @@ impl App {
         if let Some(m) = self.modal.as_mut() {
             match m.key(k) {
                 Step::Pending => {}
-                Step::Cancel => self.modal = self.parent.take(),
+                Step::Cancel => {
+                    self.modal = self.parent.take();
+                    self.pending_download = None;
+                }
                 Step::Done(out) => self.on_modal_done(out),
             }
             return;
@@ -821,7 +901,8 @@ impl App {
                 if self.current.is_some() {
                     self.cancel_all();
                 } else if self.composer.is_empty() {
-                    self.quit = true;
+                    self.quit_confirm = true;
+                    self.scroll.off = 0;
                 } else {
                     self.composer.clear();
                 }
@@ -897,16 +978,11 @@ impl App {
         self.persist_history();
         match command::parse_input(&text) {
             Parsed::Empty => {}
-            Parsed::Urls(urls) => {
-                for u in urls {
-                    self.push(dim(format!("\u{203a} {u}")));
-                    self.enqueue(&u);
-                }
-            }
+            Parsed::Urls(urls) => self.submit_urls(urls),
             Parsed::Inline(Err(msg)) => {
                 self.echo(&text);
                 self.push(error_line(&msg));
-                self.push(detail("usage: URL... [/f format] [/o folder] [/force]"));
+                self.push(detail("usage: URL... [/f format] [/o folder|ex:tempsh] [/force]"));
             }
             Parsed::Inline(Ok(inl)) => {
                 self.echo(&text);
@@ -936,14 +1012,18 @@ impl App {
             Some(Err(e)) => return self.push(error_line(&e)),
             None => self.spec,
         };
-        let dest = match inl.dest.as_deref().map(|d| self.cfg.resolve_dest(d)) {
-            Some(Ok(d)) => d.components().collect(),
-            Some(Err(e)) => return self.push(error_line(&format!("{e:#}"))),
-            None => self.dest.clone(),
-        };
-        let upload = self.upload && inl.dest.is_none();
-        for u in &inl.urls {
-            self.enqueue_with(u, spec, dest.clone(), upload, inl.force);
+        let batch = PendingDownload { urls: inl.urls, spec, force: inl.force };
+        match inl.dest.as_deref() {
+            Some(dest) if config::is_temp_sh_dest(dest) => self.enqueue_batch(batch, self.dest.clone(), true),
+            Some(dest) => match self.cfg.resolve_dest(dest) {
+                Ok(dest) => self.enqueue_batch(batch, dest.components().collect(), false),
+                Err(e) => self.push(error_line(&format!("{e:#}"))),
+            },
+            None if self.cfg.settings.ask_save_method => {
+                self.pending_download = Some(batch);
+                self.modal = Some(Modal::Dest(DestPicker::with_upload(&self.cfg, &self.dest, false)));
+            }
+            None => self.enqueue_batch(batch, self.dest.clone(), self.upload),
         }
     }
 
@@ -959,6 +1039,7 @@ impl App {
             "o" if args.is_empty() => {
                 self.modal = Some(Modal::Dest(DestPicker::with_upload(&self.cfg, &self.dest, self.upload)));
             }
+            "o" if config::is_temp_sh_dest(args) => self.on_modal_done(ModalOut::Dest(DestChoice::TempSh)),
             "o" => match self.cfg.resolve_dest(args) {
                 Ok(d) => self.set_dest(d),
                 Err(e) => self.push(error_line(&format!("{e:#}"))),
@@ -977,6 +1058,8 @@ impl App {
             "update" if args.is_empty() => self.start_maintenance(Work::Update, "Updating tools"),
             "upgrade" if args.is_empty() => self.start_maintenance(Work::Upgrade(None), "Checking for a yd upgrade"),
             "update" | "upgrade" => self.push(error_line(&format!("/{name} takes no arguments"))),
+            "history" if args.is_empty() => self.open_session_history(),
+            "history" => self.push(error_line("/history takes no arguments")),
             "help" => self.print_help(),
             "q" => self.quit = true,
             _ => {}
@@ -1032,7 +1115,7 @@ impl App {
         self.push(detail("\u{23ce} download (several URLs may be pasted at once; they queue)"));
         self.push(detail("\u{2191}\u{2193} / ctrl+p/n history \u{b7} PgUp/PgDn scroll \u{b7} End follow \u{b7} \u{2191}\u{2193} choose suggestion while typing (shift+\u{2191}\u{2193} always) \u{b7} tab or \u{2192} accept"));
         self.push(detail("ctrl+v paste \u{b7} ctrl+u clear \u{b7} ctrl+w delete word"));
-        self.push(detail("ctrl+c cancel download / quit \u{b7} ctrl+d quit"));
+        self.push(detail("ctrl+c cancel download / confirm quit \u{b7} ctrl+d quit"));
     }
 
     fn set_format(&mut self, spec: FormatSpec) {
@@ -1068,13 +1151,21 @@ impl App {
             }
             ModalOut::Dest(DestChoice::TempSh) => {
                 self.modal = self.parent.take();
-                self.upload = true;
-                self.push(ok_line("Upload to temp.sh"));
+                if let Some(batch) = self.pending_download.take() {
+                    self.enqueue_batch(batch, self.dest.clone(), true);
+                } else {
+                    self.upload = true;
+                    self.push(ok_line("Upload to temp.sh"));
+                }
             }
             ModalOut::Dest(DestChoice::Local(s)) => match self.cfg.resolve_dest(&s) {
                 Ok(d) => {
                     self.modal = self.parent.take();
-                    self.set_dest(d);
+                    if let Some(batch) = self.pending_download.take() {
+                        self.enqueue_batch(batch, d.components().collect(), false);
+                    } else {
+                        self.set_dest(d);
+                    }
                 }
                 Err(e) => {
                     if let Some(m) = self.modal.as_mut() {
@@ -1128,6 +1219,17 @@ impl App {
         let area = f.area();
         let (w, h) = (area.width as usize, area.height as usize);
         self.height = h;
+        if let Some(history) = &mut self.history_view {
+            let body = Rect { height: area.height.saturating_sub(1), ..area };
+            let (rows, _) = history.visible(w, body.height as usize, Vec::new(), None);
+            f.render_widget(Paragraph::new(rows), body);
+            if area.height > 0 {
+                let footer = Rect { y: area.bottom() - 1, height: 1, ..area };
+                let controls = truncate("  Session history · ↑↓ / PgUp / PgDn · Home / End · Esc close", w);
+                f.render_widget(Paragraph::new(ansi::to_line(&dim(controls))), footer);
+            }
+            return;
+        }
         let (live, cursor) = self.view(w);
         let live: Vec<Line> = live.iter().map(|l| ansi::to_line(l)).collect();
         let (rows, cur) = self.scroll.visible(w, h, live, cursor);
@@ -1151,6 +1253,10 @@ impl App {
             let cursor = cur.map(|(x, y)| (x, y + lines.len() as u16));
             lines.extend(body);
             return (lines, cursor);
+        }
+        if self.quit_confirm {
+            lines.push(heading("Quit yd? [y/N] · Ctrl+C to confirm"));
+            return (lines, None);
         }
         if let Some(next) = &self.pending_upgrade {
             lines.push(heading(&format!("{} [y/N]", next.question())));
@@ -1243,7 +1349,51 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(Config::default(), ToolOptions { skip_deno: true })
+        let mut cfg = Config::default();
+        cfg.settings.history_persist = false;
+        App::new(cfg, ToolOptions { skip_deno: true })
+    }
+
+    #[test]
+    fn asks_on_each_submission_unless_destination_is_explicit() {
+        let mut a = app();
+        a.maintenance = true; // Inspect queued jobs before they reach the worker.
+        let url = "https://example.com/video";
+        a.submit_urls(vec![url.into()]);
+        assert!(a.pending_download.is_some() && a.queue.is_empty());
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.queue[0].job.upload);
+        assert!(!a.upload);
+
+        a.submit_urls(vec![url.into()]);
+        assert!(a.pending_download.is_some());
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.pending_download.is_none() && a.modal.is_none());
+        assert_eq!(a.queue.len(), 1);
+
+        a.composer.set(&format!("{url} /o ex:tempsh"));
+        a.submit();
+        assert!(a.modal.is_none());
+        assert!(a.queue[1].job.upload);
+
+        a.cfg.settings.ask_save_method = false;
+        a.submit_urls(vec![url.into()]);
+        assert!(a.modal.is_none());
+        assert!(!a.queue[2].job.upload);
+    }
+
+    #[test]
+    fn ctrl_c_requires_confirmation_to_quit() {
+        let mut a = app();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        a.on_key(ctrl_c);
+        assert!(a.quit_confirm && !a.quit);
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!a.quit_confirm && !a.quit);
+        a.on_key(ctrl_c);
+        a.on_key(ctrl_c);
+        assert!(a.quit);
     }
 
     #[test]

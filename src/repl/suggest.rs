@@ -127,6 +127,9 @@ fn dests(tok: &str, ctx: &Ctx) -> Vec<Cand> {
     if tok.is_empty() {
         out.extend(recents("r:", ctx));
     }
+    if crate::config::TEMP_SH_DEST.starts_with(&lower) {
+        out.push(cand(crate::config::TEMP_SH_DEST, crate::config::TEMP_SH_DEST, "Upload to temp.sh"));
+    }
     out
 }
 
@@ -228,7 +231,9 @@ mod tests {
         let (s, _) = run("/o r:1");
         assert_eq!(inserts(&s), ["r:1"]);
         let (s, _) = run("/o ");
-        assert_eq!(inserts(&s), ["music", "clips", "r:0", "r:1"]);
+        assert_eq!(inserts(&s), ["music", "clips", "r:0", "r:1", "ex:tempsh"]);
+        let (s, _) = run("https://a.com/x /o ex:");
+        assert_eq!(inserts(&s), ["ex:tempsh"]);
         let (s, _) = run("/fav rm cl");
         assert_eq!(inserts(&s), ["clips"]);
     }

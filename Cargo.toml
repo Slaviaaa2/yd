@@ -1,6 +1,6 @@
 [package]
 name = "yd"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 description = "Fast, friendly yt-dlp front-end: one-shot CLI and interactive TUI"
 repository = "https://github.com/Slaviaaa2/yd"
@@ -26,6 +26,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = { version = "0.10", features = ["std"] }
 tar = "0.4.46"
+time = "0.3"
 toml = "1.2.1"
 unicode-width = "0.2.3"
 ureq = "3.5.2"

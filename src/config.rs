@@ -10,10 +10,17 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_RECENT_KEEP: usize = 10;
 pub const DEFAULT_HISTORY_KEEP: usize = 500;
 
-/// Interactive-mode settings (`[settings]` in config.toml). Missing keys = defaults.
+pub const TEMP_SH_DEST: &str = "ex:tempsh";
+
+pub fn is_temp_sh_dest(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(TEMP_SH_DEST)
+}
+
+/// Settings in config.toml. Missing keys use defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
+    pub ask_save_method: bool,
     pub recent_keep: usize,
     pub history_persist: bool,
     pub history_keep: usize,
@@ -29,6 +36,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            ask_save_method: true,
             recent_keep: DEFAULT_RECENT_KEEP,
             history_persist: true,
             history_keep: DEFAULT_HISTORY_KEEP,
@@ -72,6 +80,11 @@ pub fn config_path() -> PathBuf {
 /// Input history file (one entry per line).
 pub fn history_path() -> PathBuf {
     config_dir().join("history")
+}
+
+/// One transcript file per interactive session, stored separately from input recall.
+pub fn session_history_dir() -> PathBuf {
+    config_dir().join("sessions")
 }
 
 /// Read the history file; missing = empty.

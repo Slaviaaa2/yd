@@ -295,6 +295,7 @@ impl App {
 enum Item {
     DefFormat,
     DefDest,
+    AskSaveMethod,
     RecentKeep,
     ClearRecent,
     HistPersist,
@@ -308,9 +309,10 @@ enum Item {
     ExitSummary,
 }
 
-const ITEMS: [Item; 13] = [
+const ITEMS: [Item; 14] = [
     Item::DefFormat,
     Item::DefDest,
+    Item::AskSaveMethod,
     Item::RecentKeep,
     Item::ClearRecent,
     Item::HistPersist,
@@ -347,12 +349,13 @@ impl Item {
         match self {
             Item::DefFormat => "Default format",
             Item::DefDest => "Default save folder",
+            Item::AskSaveMethod => "Ask where to save",
             Item::RecentKeep => "Recent folders \u{b7} keep",
             Item::ClearRecent => "Clear recent folders",
             Item::HistPersist => "History \u{b7} persist",
             Item::HistKeep => "History \u{b7} keep",
             Item::HistTrim => "Delete history older than\u{2026}",
-            Item::HistClear => "Clear history",
+            Item::HistClear => "Clear input history",
             Item::Template => "Filename template",
             Item::Force => "Overwrite existing",
             Item::Playlist => "Whole playlist (v=&list=)",
@@ -381,6 +384,7 @@ impl App {
         match it {
             Item::DefFormat => self.spec.to_string(),
             Item::DefDest => ui::abbrev_home(&self.dest),
+            Item::AskSaveMethod => onoff(s.ask_save_method),
             Item::RecentKeep => format!("\u{2039} {} \u{203a}", s.recent_keep),
             Item::HistKeep => format!("\u{2039} {} \u{203a}", s.history_keep),
             Item::HistPersist => onoff(s.history_persist),
@@ -503,7 +507,12 @@ impl App {
                 s.history_persist = !s.history_persist;
                 let on = s.history_persist;
                 self.persist_history();
+                self.sync_session_log();
                 format!("History persistence {}", if on { "on" } else { "off" })
+            }
+            Item::AskSaveMethod => {
+                s.ask_save_method = !s.ask_save_method;
+                format!("Ask where to save {}", if s.ask_save_method { "on" } else { "off" })
             }
             Item::Force => {
                 s.force = !s.force;

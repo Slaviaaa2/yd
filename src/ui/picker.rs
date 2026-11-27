@@ -513,6 +513,7 @@ impl Default for PathInput {
 // ---------------------------------------------------------------------------------------------
 
 enum DestStage {
+    Method,
     List,
     Input,
 }
@@ -525,6 +526,7 @@ pub enum DestChoice<T = String> {
 
 pub struct DestPicker {
     stage: DestStage,
+    method: Option<Box<Picker>>,
     picker: Picker,
     /// `None` opens the path editor.
     choices: Vec<Option<DestChoice>>,
@@ -548,17 +550,21 @@ impl DestPicker {
         let fav_paths: Vec<&PathBuf> = cfg.favorites.iter().map(|f| &f.path).collect();
         // The current destination always appears, even when it is neither favorite nor recent.
         let known = fav_paths.iter().any(|p| is_cur(p)) || cfg.recent.iter().any(|p| is_cur(p));
-        if uploading.is_some() {
-            items.push(Item::new("Save on this computer", super::abbrev_home(current)));
-            choices.push(Some(DestChoice::Local(current.display().to_string())));
-            items.push(Item::new("Upload to temp.sh", ""));
-            choices.push(Some(DestChoice::TempSh));
-        } else if !known {
-            let mut it = Item::new(format!("\u{b7} {}", super::abbrev_home(current)), "current");
+        if !known {
+            let mut it = Item::new(format!("· {}", super::abbrev_home(current)), "current");
             it.search = current.display().to_string();
             items.push(it);
             choices.push(Some(DestChoice::Local(current.display().to_string())));
             cur = Some(0);
+        }
+        if uploading.is_some()
+            && let Some(downloads) = dirs::download_dir()
+            && downloads != current
+            && !fav_paths.contains(&&downloads)
+            && !cfg.recent.contains(&downloads)
+        {
+            items.push(Item::new("Downloads", super::abbrev_home(&downloads)));
+            choices.push(Some(DestChoice::Local(downloads.display().to_string())));
         }
         for (i, f) in cfg.favorites.iter().enumerate() {
             if is_cur(&f.path) {
@@ -582,9 +588,15 @@ impl DestPicker {
         enter.sticky = true;
         items.push(enter);
         choices.push(None);
+        let method = uploading.map(|uploading| Box::new(Picker::new(
+            "Save method",
+            vec![Item::new("Save on this computer", ""), Item::new("Upload to temp.sh", "")],
+            Some(usize::from(uploading)),
+        )));
         DestPicker {
-            stage: DestStage::List,
-            picker: Picker::new("Save to", items, uploading.map(usize::from).or(cur)),
+            stage: if method.is_some() { DestStage::Method } else { DestStage::List },
+            method,
+            picker: Picker::new("Save folder", items, cur),
             choices,
             input: PathInput::new(),
         }
@@ -596,6 +608,15 @@ impl Interactive for DestPicker {
 
     fn key(&mut self, k: KeyEvent) -> Step<DestChoice> {
         match self.stage {
+            DestStage::Method => match self.method.as_mut().unwrap().key(k) {
+                Step::Done(0) => {
+                    self.stage = DestStage::List;
+                    Step::Pending
+                }
+                Step::Done(_) => Step::Done(DestChoice::TempSh),
+                Step::Cancel => Step::Cancel,
+                Step::Pending => Step::Pending,
+            },
             DestStage::List => match self.picker.key(k) {
                 Step::Done(i) => match &self.choices[i] {
                     Some(p) => Step::Done(p.clone()),
@@ -604,6 +625,10 @@ impl Interactive for DestPicker {
                         Step::Pending
                     }
                 },
+                Step::Cancel if self.method.is_some() && k.code == KeyCode::Esc => {
+                    self.stage = DestStage::Method;
+                    Step::Pending
+                }
                 Step::Cancel => Step::Cancel,
                 Step::Pending => Step::Pending,
             },
@@ -620,6 +645,7 @@ impl Interactive for DestPicker {
 
     fn paste(&mut self, s: &str) {
         match self.stage {
+            DestStage::Method => self.method.as_mut().unwrap().paste(s),
             DestStage::List => self.picker.paste(s),
             DestStage::Input => self.input.paste(s),
         }
@@ -627,6 +653,7 @@ impl Interactive for DestPicker {
 
     fn lines(&self, width: usize) -> Vec<String> {
         match self.stage {
+            DestStage::Method => self.method.as_ref().unwrap().lines(width),
             DestStage::List => self.picker.lines(width),
             DestStage::Input => self.input.lines(width),
         }
@@ -634,6 +661,7 @@ impl Interactive for DestPicker {
 
     fn cursor(&self, width: usize) -> Option<(u16, u16)> {
         match self.stage {
+            DestStage::Method => self.method.as_ref().unwrap().cursor(width),
             DestStage::List => self.picker.cursor(width),
             DestStage::Input => self.input.cursor(width),
         }
@@ -641,6 +669,7 @@ impl Interactive for DestPicker {
 
     fn error(&mut self, msg: String) {
         match self.stage {
+            DestStage::Method => self.method.as_mut().unwrap().set_error(msg),
             DestStage::List => self.picker.set_error(msg),
             DestStage::Input => self.input.error = Some(msg),
         }
@@ -759,6 +788,23 @@ mod tests {
         p.key(key(KeyCode::Down));
         assert_eq!(p.selected(), Some(0));
         assert_eq!(p.top, 0);
+    }
+
+    #[test]
+    fn local_method_opens_folder_choices() {
+        let mut cfg = Config::default();
+        let current = Path::new("/default");
+        cfg.recent.push(PathBuf::from("/recent"));
+        let mut picker = DestPicker::with_upload(&cfg, current, false);
+        let lines = picker.lines(80).join("\n");
+        assert!(lines.contains("Save on this computer"));
+        assert!(lines.contains("Upload to temp.sh"));
+        assert!(!lines.contains("r:0"));
+
+        assert!(matches!(picker.key(key(KeyCode::Enter)), Step::Pending));
+        assert!(picker.lines(80).join("\n").contains("r:0"));
+        picker.paste("r:0");
+        assert!(matches!(picker.key(key(KeyCode::Enter)), Step::Done(DestChoice::Local(path)) if path == "/recent"));
     }
 
     #[test]

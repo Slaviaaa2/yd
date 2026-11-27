@@ -21,11 +21,11 @@ pub struct Cli {
     #[arg(short, long, value_name = "SPEC")]
     pub format: Option<String>,
 
-    /// Destination: favorite name, f:N / r:N (Nth favorite / recent), or directory (created if missing)
+    /// Destination: favorite name, f:N / r:N, directory, or ex:tempsh
     #[arg(short, long, value_name = "DEST")]
     pub out: Option<String>,
 
-    /// Pick format and destination interactively
+    /// Pick format and destination interactively (given --out, pick only format)
     #[arg(short, long)]
     pub pick: bool,
 

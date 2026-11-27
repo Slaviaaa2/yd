@@ -34,10 +34,10 @@ fn format_ok(val: &str, partial: bool) -> bool {
 }
 
 fn dest_ok(cfg: &Config, val: &str, partial: bool) -> bool {
-    cfg.dest_is_valid(val)
+    crate::config::is_temp_sh_dest(val) || cfg.dest_is_valid(val)
         || (partial && {
             let v = val.to_lowercase();
-            v == "f" || v == "r" || v == "f:" || v == "r:" || cfg.favorites.iter().any(|f| f.name.to_lowercase().starts_with(&v))
+            crate::config::TEMP_SH_DEST.starts_with(&v) || v == "f" || v == "r" || v == "f:" || v == "r:" || cfg.favorites.iter().any(|f| f.name.to_lowercase().starts_with(&v))
         })
 }
 

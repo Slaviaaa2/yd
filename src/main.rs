@@ -99,20 +99,22 @@ fn real_main(cli: Cli) -> anyhow::Result<u8> {
         None => FormatSpec::DEFAULT,
     };
     let mut spec = spec;
+    let mut upload = cli.out.as_deref().is_some_and(config::is_temp_sh_dest);
     let mut dest = match cli.out.as_deref() {
-        Some(o) => match cfg.resolve_dest(o) {
+        Some(o) if !upload => match cfg.resolve_dest(o) {
             Ok(d) => d,
             Err(e) => return Ok(usage_error(&format!("{e:#}"))),
         },
-        None => cfg.default_dest(),
+        _ => cfg.default_dest(),
     };
-    let mut upload = false;
     if cli.pick {
         let Some(picked) = ui::picker::pick_format(&spec)? else {
             eprintln!("{}", ui::error_line("Cancelled"));
             return Ok(EXIT_INTERRUPTED);
         };
         spec = picked;
+    }
+    if cli.out.is_none() && (cli.pick || (cfg.settings.ask_save_method && interactive_terminal())) {
         let Some(picked) = ui::picker::pick_dest(&cfg, &dest)? else {
             eprintln!("{}", ui::error_line("Cancelled"));
             return Ok(EXIT_INTERRUPTED);
